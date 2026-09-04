@@ -107,10 +107,10 @@ export class ProjectArtifactProvider implements StorageProvider {
           if (rule.category === "project-dependencies" && (!(await hasFile(root, "package.json")) || !(await packageLocks.some((lock) => hasFile(root, lock))))) continue;
           if (rule.category === "project-environments" && !(await isPythonEnvironment(target))) continue;
           const measured = await measureTree(target).catch(() => undefined);
-          if (!measured) continue;
           const ageDays = Math.max(0, (context.now - stats.mtimeMs) / 86_400_000);
           const blockers = ageDays < rule.minAgeDays ? [`younger-than-${rule.minAgeDays}-days`] : [];
           if (isWithinAny([target], context.cwd)) blockers.push("current-directory");
+          if (!measured) blockers.push("unmeasurable");
           output.push({
             id: hashValue({ provider: this.id, root, name, category: rule.category }).slice(0, 16),
             provider: this.id,
@@ -120,13 +120,14 @@ export class ProjectArtifactProvider implements StorageProvider {
             target: { kind: "path", path: target },
             reason: `${rule.reason}: ${path.basename(root)}/${name}`,
             evidence: rule.evidence,
-            bytes: measured.bytes,
-            fileCount: measured.fileCount,
+            bytes: measured?.bytes ?? 0,
+            fileCount: measured?.fileCount ?? 0,
             mtimeMs: stats.mtimeMs,
             fingerprint: fingerprintFromStats(stats),
             eligible: blockers.length === 0,
             blockers,
             autoSafe: false,
+            partialMeasurement: measured?.partial,
             metadata: { projectRoot: root, artifactName: name, minAgeDays: rule.minAgeDays },
           });
         }
@@ -156,7 +157,9 @@ export class ProjectArtifactProvider implements StorageProvider {
     if (artifactName === "node_modules" && (!(await hasFile(root, "package.json")) || !(await packageLocks.some((lock) => hasFile(root, lock))))) return { ok: false, reason: "package lock evidence missing" };
     if ([".venv", "venv", "env"].includes(artifactName) && !(await isPythonEnvironment(target))) return { ok: false, reason: "Python environment marker missing" };
     const measured = await measureTree(target).catch(() => undefined);
-    if (!measured || measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
+    if (!measured) return { ok: false, reason: "contents-changed-since-scan" };
+    if (measured.partial) return { ok: false, reason: "partial-measurement" };
+    if (measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
     return { ok: true };
   }
 
