@@ -13,12 +13,14 @@ import { autoPlan } from "./core/auto.js";
 import { createPlan, loadPlan, savePlan } from "./core/plan.js";
 import { buildReport } from "./core/report.js";
 import { runChecklist } from "./ui/checklist.js";
-import { formatBytes } from "./core/output.js";
+import { formatBytes, humanFailure, shortLabelForCandidate } from "./core/output.js";
 import { printPlan, printProviders, printResult, printSummary } from "./core/output.js";
 import { scanProviders } from "./core/scan.js";
+import { latestManifest } from "./core/manifest.js";
+import { createProgress } from "./ui/progress.js";
 import { providerMap, providers } from "./providers/registry.js";
 import { installScheduler, schedulerStatus, uninstallScheduler } from "./platform/scheduler.js";
-import type { RunResult } from "./core/types.js";
+import type { Plan, RunResult } from "./core/types.js";
 
 const require = createRequire(import.meta.url);
 
@@ -74,10 +76,38 @@ function parseOptions(args: string[]): { positionals: string[]; options: Options
 }
 
 function usage(output: NodeJS.WritableStream = stdout): void {
-  output.write(`agentclean — safe storage cleanup for AI coding tools\n\nUsage:\n  agentclean [scan] [options]\n  agentclean clean [options]\n  agentclean auto --once [options]\n  agentclean providers [--json]\n  agentclean explain <candidate-id> --plan <plan.json>\n  agentclean doctor\n  agentclean config root add <path>\n  agentclean auto install --interval weekly\n  agentclean auto uninstall\n  agentclean auto status\n\nOptions:\n  --json              Machine-readable output\n  --out <file>        Save a scan plan\n  --plan <file>       Execute or inspect an explicit plan\n  --dry-run           Never mutate anything\n  --yes               Skip confirmation (requires --plan or auto --once)\n  --strict            Fail if any candidate is declined, skipped, or fails\n  --category <name>   worktrees, ai-history, ai-caches, package-caches\n  --provider <name>   Limit to one provider\n  --root <path>       Add an explicit repository root
-  --project-artifacts Scan configured roots for node_modules, venvs, and build output
-  --force-unlock      Reclaim a lock held by a process on another host
-  --version           Print the version number
+  output.write(`agentclean — safe storage cleanup for AI coding tools
+
+The short version:
+  agentclean                    look around, see what could be freed
+  agentclean clean               choose what to remove, one item at a time
+  agentclean clean --dry-run     preview a real run without changing anything
+  agentclean scan -v             full detail on everything found
+
+Options you'll actually use:
+  --root <path>         also look in this folder
+  --dry-run              never change anything
+  --yes, -y              skip the confirmation (only with --plan or auto --once)
+  -v, --verbose          full detail instead of the short summary
+  --json                  machine-readable output, for scripts
+
+-v and --json work on every command below too.
+
+Less common:
+  agentclean providers                 what agentclean can see on this machine
+  agentclean explain <candidate-id>    why one item was flagged (needs --plan)
+  agentclean doctor                    diagnostics for a bug report
+  agentclean config root add <path>    remember a folder for every future scan
+  agentclean auto install --interval <weekly|...>   set up scheduled cleanup
+  agentclean auto uninstall | status   manage scheduled cleanup
+  --out <file>            save a scan to a plan file
+  --plan <file>            act on a saved plan instead of scanning fresh
+  --category <name>       limit to one kind: worktrees, ai-history, ai-caches, package-caches
+  --provider <name>        limit to one tool
+  --project-artifacts      also scan for node_modules, virtualenvs, and build output
+  --strict                  treat any skip or decline as a failure (exit code)
+  --force-unlock            reclaim a lock left by a crashed run on another machine
+  --version                 print the version number
 `);
 }
 
@@ -140,7 +170,7 @@ async function runClean(options: Options, autoOnly = false): Promise<number> {
   if (options.dryRun) {
     const result = await executePlan(selected, map, { ...context, dryRun: true }, { dryRun: true, strict: options.strict });
     if (options.json) await writeOutput({ plan: selected, result }, options);
-    else printResult(result, stdout);
+    else printResult(result, selected, stdout);
     return EXIT_OK;
   }
   const guard = requiresExplicitPlan({ autoOnly, yes: options.yes, plan: options.plan, category: options.category, provider: options.provider, isTty: Boolean(stdin.isTTY && stdout.isTTY) });
@@ -171,10 +201,43 @@ async function runClean(options: Options, autoOnly = false): Promise<number> {
       return EXIT_OK;
     }
   }
-  const result = await executePlan(toExecute, map, { ...context, dryRun: false }, { dryRun: false, strict: options.strict, forceUnlock: options.forceUnlock });
+  const result = await executeWithProgress(toExecute, map, context, { dryRun: false, strict: options.strict, forceUnlock: options.forceUnlock }, options.json ? undefined : stdout);
   if (options.json) await writeOutput({ plan: selected, result }, options);
-  else printResult(result, stdout);
+  else printResult(result, toExecute, stdout);
   return cleanExitCode(result);
+}
+
+/**
+ * `executePlan` (core/executor.ts) has no progress callback, so this drives
+ * the terminal from the outside instead: `latestManifest` reads the exact
+ * run-*.json that `executePlan`'s own `persist()` writes to disk after each
+ * candidate, filtered to this plan's hash so a stale manifest from an earlier
+ * run is never mistaken for this one. The candidate about to run (not yet in
+ * the manifest) comes straight from `toExecute.candidates[completedCount]` -
+ * the executor processes candidates strictly in that order - so the line
+ * keeps moving even mid-way through one slow command (e.g. `uv cache prune`
+ * running for two minutes with nothing yet written to the manifest).
+ */
+async function executeWithProgress(toExecute: Plan, map: ReturnType<typeof providerMap>, context: Awaited<ReturnType<typeof makeContextWithDiscoveredRoots>>, executeOptions: { dryRun: boolean; strict: boolean; forceUnlock?: boolean }, progressOutput: NodeJS.WritableStream & { isTTY?: boolean; columns?: number } | undefined): Promise<RunResult> {
+  const progress = progressOutput ? createProgress(progressOutput) : undefined;
+  let polling: NodeJS.Timeout | undefined;
+  if (progress) {
+    polling = setInterval(() => {
+      void latestManifest(context.env).then((manifest) => {
+        const current = manifest?.planHash === toExecute.hash ? manifest : undefined;
+        const completed = current?.results.length ?? 0;
+        const freed = current?.deletedBytes ?? 0;
+        const candidate = toExecute.candidates[completed];
+        progress.update(candidate ? shortLabelForCandidate(candidate) : "finishing up", freed);
+      }).catch(() => undefined);
+    }, 100);
+  }
+  try {
+    return await executePlan(toExecute, map, { ...context, dryRun: false }, executeOptions);
+  } finally {
+    if (polling) clearInterval(polling);
+    progress?.clear();
+  }
 }
 
 /**
@@ -278,6 +341,27 @@ function computeIsEntryPoint(): boolean {
   }
 }
 
+/**
+ * `locks.ts` (not owned here) throws two exact message shapes for a held
+ * lock, matched here by their distinguishing substrings since editing that
+ * file is out of scope. The two are not interchangeable: `--force-unlock`
+ * only bypasses a *foreign-host* lock (see `acquireLock`'s `foreignHost`
+ * branch) - a genuinely active same-host run has no override, so the two
+ * cases get different, verified-against-that-code advice. Anything else
+ * falls through to `humanFailure` for the same OS-error translation
+ * `printResult` uses, so a raw ENOSPC/EACCES/ENOENT that escapes to the top
+ * level still reads as a sentence instead of a stack-trace-shaped string.
+ */
+function friendlyTopLevelError(message: string): string {
+  if (message.includes("use --force-unlock to override")) {
+    return "Another machine's agentclean run holds the lock here. If you're sure it isn't really running, retry with --force-unlock.";
+  }
+  if (message.includes("another cleanup run is active")) {
+    return "Another agentclean cleanup is already running. Wait for it to finish, then try again.";
+  }
+  return humanFailure(message);
+}
+
 const isEntryPoint = computeIsEntryPoint();
 if (isEntryPoint) {
   main().then((code) => { process.exitCode = code; }).catch((error: unknown) => {
@@ -287,7 +371,7 @@ if (isEntryPoint) {
       process.exitCode = EXIT_USAGE;
       return;
     }
-    stderr.write(`${error instanceof Error ? error.message : "unexpected error"}\n`);
+    stderr.write(`${error instanceof Error ? friendlyTopLevelError(error.message) : "unexpected error"}\n`);
     process.exitCode = EXIT_FATAL;
   });
 }

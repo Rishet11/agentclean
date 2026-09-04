@@ -1,10 +1,10 @@
-import type { Plan, ProviderDetection, RunResult } from "./types.js";
+import type { Candidate, Plan, ProviderDetection, RunResult } from "./types.js";
 import { categoryLabel } from "./policy.js";
 import { displayPath } from "./paths.js";
 import { buildReport, type ReportRow } from "./report.js";
 import { tierLabel } from "./tiers.js";
 import type { RestoreTier } from "./types.js";
-import { bold, colorEnabled, dim, gray } from "../ui/style.js";
+import { bold, colorEnabled, dim, gray, green, red, yellow } from "../ui/style.js";
 import { formatDuration, padRight, truncateToWidth } from "../ui/layout.js";
 
 export function formatBytes(bytes: number): string {
@@ -74,6 +74,17 @@ export function shortLabel(row: { provider: string; category: string; label: str
   }
 }
 
+/** shortLabel() takes a row-shaped `{provider, category, label}`; a raw
+ * `Candidate` carries its label inside `target` instead. Same rule either way:
+ * path candidates show the path, command candidates show the literal command. */
+function candidateLabel(candidate: Candidate): string {
+  return candidate.target.kind === "path" ? candidate.target.path : candidate.target.command.join(" ");
+}
+
+export function shortLabelForCandidate(candidate: Candidate): string {
+  return shortLabel({ provider: candidate.provider, category: candidate.category, label: candidateLabel(candidate) });
+}
+
 function friendlyProvider(provider: string): string {
   switch (provider) {
     case "claude": return "Claude Code";
@@ -112,10 +123,19 @@ function basenameOf(value: string): string {
 export function printSummary(plan: Plan, output: NodeJS.WritableStream): void {
   const colorOn = colorEnabled(output as { isTTY?: boolean });
   const model = buildReport(plan);
+
+  if (model.totalCandidates === 0) {
+    output.write(`\n  ${bold("Nothing to clean here.", colorOn)}\n`);
+    output.write("  Either this machine is already tidy, or nothing in your usual project folders matched yet.\n");
+    output.write(`  Try ${bold("agentclean scan --project-artifacts", colorOn)} to also look for node_modules, virtualenvs, and build output,\n`);
+    output.write(`  or ${bold("agentclean config root add <path>", colorOn)} to point it at a folder you keep projects in.\n\n`);
+    return;
+  }
+
   const leftAlone = model.totalBytes - model.eligibleBytes;
 
   output.write("\n");
-  output.write(`  ${bold(`${formatBytes(model.totalBytes)} found`, colorOn)}  ${dim("\u00b7", colorOn)}  ${bold(`${formatBytes(model.eligibleBytes)} safe to clear now`, colorOn)}\n\n`);
+  output.write(`  ${bold(`${formatBytes(model.totalBytes)} found`, colorOn)}  ${dim("\u00b7", colorOn)}  ${bold(green(`${formatBytes(model.eligibleBytes)} safe to clear now`, colorOn), colorOn)}\n\n`);
 
   const eligible = model.rows.filter((row) => row.eligible).slice(0, 5);
   for (const row of eligible) {
@@ -127,7 +147,7 @@ export function printSummary(plan: Plan, output: NodeJS.WritableStream): void {
 
   if (leftAlone > 0) {
     const reasons = model.blocked.slice(0, 3).map((entry) => humanReason(entry.reason)).join(", ");
-    output.write(`\n  ${formatBytes(leftAlone)} left alone  ${dim("\u00b7", colorOn)}  ${dim(reasons || "protected", colorOn)}\n`);
+    output.write(`\n  ${yellow(`${formatBytes(leftAlone)} left alone`, colorOn)}  ${dim("\u00b7", colorOn)}  ${dim(reasons || "protected", colorOn)}\n`);
   }
 
   output.write(`\n  ${bold("agentclean clean", colorOn)}      choose what to remove\n`);
@@ -203,7 +223,122 @@ export function printProviders(detections: ProviderDetection[], output: NodeJS.W
   for (const detection of detections) output.write(`${detection.id}\t${detection.status}\t${detection.details}${detection.root ? `\t${displayPath(detection.root)}` : ""}\n`);
 }
 
-export function printResult(result: RunResult, output: NodeJS.WritableStream): void {
-  output.write(`Deleted: ${formatBytes(result.deletedBytes)}\nWould delete: ${formatBytes(result.wouldDeleteBytes)}\nSkipped: ${formatBytes(result.skippedBytes)}\nFailed: ${formatBytes(result.failedBytes)}\n`);
-  for (const entry of result.results) if (entry.status === "skipped" || entry.status === "failed") output.write(`- ${entry.candidateId}: ${entry.status}${entry.reason ? ` (${entry.reason})` : ""}\n`);
+/** A blocker reason can be several joined with ", " (see executor.ts's
+ * `candidate.blockers.join(", ")`); group and speak to the first (primary) one,
+ * same rule report.ts's blockedRollupFor uses. */
+function primaryReason(raw: string): string {
+  return humanReason(raw.split(", ")[0]?.trim() || raw);
+}
+
+/**
+ * Raw OS/provider errors a person actually hits, turned into a sentence that
+ * says what happened. Only advice verified against this codebase's own
+ * behavior is included (e.g. "run clean again" is true: nothing here resumes
+ * automatically, but nothing partial is lost either, so a plain re-run picks
+ * up whatever is left). Anything unrecognized passes through unchanged
+ * rather than guessing.
+ */
+export function humanFailure(reason: string): string {
+  if (/ENOSPC/.test(reason)) return "ran out of disk space partway through; free some space and run clean again to finish the rest";
+  const missingCommand = /spawn (\S+) ENOENT/.exec(reason);
+  if (missingCommand) return `the ${missingCommand[1]} command isn't installed, so this couldn't be cleaned up here; nothing was deleted`;
+  if (/EACCES|EPERM/.test(reason)) return "no permission to remove this; it may be owned by someone else or open in another program";
+  if (/^provider command exited/.test(reason)) return "the cleanup command for this reported an error";
+  return reason;
+}
+
+function durationBetween(startedAt: string, finishedAt: string): string {
+  const startMs = Date.parse(startedAt);
+  const endMs = Date.parse(finishedAt);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return "";
+  return formatDuration((endMs - startMs) / 1000);
+}
+
+interface ReasonBucket {
+  reason: string;
+  bytes: number;
+  count: number;
+}
+
+function bucketByReason(entries: Array<{ bytes: number; reason?: string }>, wordFor: (raw: string) => string): ReasonBucket[] {
+  const buckets = new Map<string, ReasonBucket>();
+  for (const entry of entries) {
+    const reason = wordFor(entry.reason || "");
+    const existing = buckets.get(reason);
+    if (existing) {
+      existing.bytes += entry.bytes;
+      existing.count += 1;
+    } else {
+      buckets.set(reason, { reason, bytes: entry.bytes, count: 1 });
+    }
+  }
+  return [...buckets.values()].sort((left, right) => right.bytes - left.bytes);
+}
+
+const RESULT_ITEMS_SHOWN = 8;
+
+/**
+ * The screen a person sees right after a clean actually runs (or a --dry-run
+ * preview of one). Answers: what got freed, in what, how long it took, and -
+ * honestly, grouped by plain-word reason - anything that was left alone or
+ * could not be removed. `plan` supplies the candidate behind each result
+ * entry so freed/kept/failed rows can use the same `shortLabel` wording as
+ * the rest of the CLI instead of a raw candidate id.
+ */
+export function printResult(result: RunResult, plan: Plan, output: NodeJS.WritableStream): void {
+  const colorOn = colorEnabled(output as { isTTY?: boolean });
+  const byId = new Map(plan.candidates.map((candidate) => [candidate.id, candidate]));
+  const resolveLabel = (candidateId: string): string => {
+    const candidate = byId.get(candidateId);
+    return candidate ? shortLabelForCandidate(candidate) : candidateId;
+  };
+
+  output.write("\n");
+
+  if (result.results.length === 0) {
+    output.write(`  ${bold("Nothing to clean here.", colorOn)} Nothing in this plan was eligible.\n\n`);
+    return;
+  }
+
+  const freedEntries = result.results.filter((entry) => entry.status === (result.dryRun ? "would-delete" : "deleted"));
+  const freedBytes = result.dryRun ? result.wouldDeleteBytes : result.deletedBytes;
+  const duration = durationBetween(result.startedAt, result.finishedAt);
+  const verb = result.dryRun ? "Would free" : "Freed";
+
+  if (freedBytes > 0) {
+    output.write(`  ${bold(green(`${verb} ${formatBytes(freedBytes)}`, colorOn), colorOn)}${duration ? dim(`, in ${duration}`, colorOn) : ""}\n`);
+    const byLabel = bucketByReason(
+      freedEntries.map((entry) => ({ bytes: entry.bytes, reason: resolveLabel(entry.candidateId) })),
+      (label) => label,
+    );
+    for (const entry of byLabel.slice(0, RESULT_ITEMS_SHOWN)) {
+      output.write(`    ${padRight(formatBytes(entry.bytes), 9)} ${entry.reason}${entry.count > 1 ? ` (x${entry.count})` : ""}\n`);
+    }
+    const hidden = byLabel.length - RESULT_ITEMS_SHOWN;
+    if (hidden > 0) output.write(`    ${dim(`+ ${hidden} more item(s)`, colorOn)}\n`);
+  } else {
+    output.write(`  ${bold("Nothing removed.", colorOn)}${duration ? dim(` (${duration})`, colorOn) : ""}\n`);
+  }
+
+  const quarantinedBytes = result.quarantinedBytes ?? 0;
+  if (quarantinedBytes > 0) output.write(`  ${formatBytes(quarantinedBytes)} moved to a safety holding area, not deleted\n`);
+
+  const kept = result.results.filter((entry) => entry.status === "declined" || entry.status === "skipped");
+  const keptBytes = (result.declinedBytes ?? 0) + result.skippedBytes;
+  if (keptBytes > 0) {
+    output.write(`\n  ${yellow(`${formatBytes(keptBytes)} left alone`, colorOn)}\n`);
+    for (const entry of bucketByReason(kept, (raw) => primaryReason(raw || "not eligible"))) {
+      output.write(`    ${padRight(formatBytes(entry.bytes), 9)} ${entry.reason}${entry.count > 1 ? ` (x${entry.count})` : ""}\n`);
+    }
+  }
+
+  const failed = result.results.filter((entry) => entry.status === "failed");
+  if (failed.length > 0) {
+    output.write(`\n  ${red(`${formatBytes(result.failedBytes)} could not be removed`, colorOn)}\n`);
+    for (const entry of bucketByReason(failed, (raw) => humanFailure(raw || "unknown error"))) {
+      output.write(`    ${padRight(formatBytes(entry.bytes), 9)} ${entry.reason}${entry.count > 1 ? ` (x${entry.count})` : ""}\n`);
+    }
+  }
+
+  output.write("\n");
 }
