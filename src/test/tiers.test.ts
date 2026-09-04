@@ -42,6 +42,26 @@ test("package caches are cheap and take their method from the provider's own cle
   assert.equal(go.method, "go clean -modcache");
 });
 
+test("new package-cache providers (yarn, bun, pip) are cheap with a non-empty method taken from their own command", () => {
+  const yarn = restoreCostFor(candidate("package-caches", { provider: "yarn", target: { kind: "command", command: ["yarn", "cache", "clean"] } }));
+  assert.equal(yarn.tier, "cheap");
+  assert.equal(yarn.needsNetwork, true);
+  assert.equal(yarn.method, "yarn cache clean");
+  assert.notEqual(yarn.method, "");
+
+  const bun = restoreCostFor(candidate("package-caches", { provider: "bun", target: { kind: "command", command: ["bun", "pm", "cache", "rm"] } }));
+  assert.equal(bun.tier, "cheap");
+  assert.equal(bun.needsNetwork, true);
+  assert.equal(bun.method, "bun pm cache rm");
+  assert.notEqual(bun.method, "");
+
+  const pip = restoreCostFor(candidate("package-caches", { provider: "pip", target: { kind: "command", command: ["pip3", "cache", "purge"] } }));
+  assert.equal(pip.tier, "cheap");
+  assert.equal(pip.needsNetwork, true);
+  assert.equal(pip.method, "pip3 cache purge");
+  assert.notEqual(pip.method, "");
+});
+
 test("project-dependencies with lockfile evidence is cheap", () => {
   const cost = restoreCostFor(candidate("project-dependencies", { metadata: { hasLockfile: true } }));
   assert.equal(cost.tier, "cheap");

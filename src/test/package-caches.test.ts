@@ -4,13 +4,64 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { CommandProvider } from "../providers/command.js";
-import { goProvider, parseCachePath, uvProvider } from "../providers/package-caches.js";
+import { bunProvider, goProvider, parseCachePath, pipProvider, uvProvider, yarnProvider } from "../providers/package-caches.js";
 
 test("detect() reports unavailable for a tool that does not exist", async () => {
   const provider = new CommandProvider("nope", "Nonexistent Tool", ["definitely-not-a-real-binary-xyz123", "cache", "dir"], ["definitely-not-a-real-binary-xyz123", "cache", "prune"], "fake cache", false);
   const detection = await provider.detect();
   assert.equal(detection.status, "unavailable");
   assert.deepEqual(await provider.discover(), []);
+});
+
+// yarn and bun are not installed on this machine (only uv and go are, besides
+// npm/pnpm), so detect() reporting "unavailable" without throwing is the one
+// path actually exercisable here for them. Their cleanup argv is asserted
+// directly off the constructed instance instead: `cleanupCommand` is a TS
+// "private" constructor-property, which is a compile-time-only restriction —
+// at runtime it is a normal own property, so this reads it without running
+// anything. pip *is* installed (as pip3), so its test below exercises the
+// live discover() path like the uv/go tests further down.
+
+test("yarn provider's detect() reports unavailable when yarn is absent, without throwing", async () => {
+  const detection = await yarnProvider().detect();
+  if (detection.status !== "unavailable") { assert.equal(detection.status, "verified"); return; } // yarn installed on this runner
+  assert.equal(detection.status, "unavailable");
+  assert.deepEqual(await yarnProvider().discover(), []);
+});
+
+test("yarn provider's cleanup command is exactly 'yarn cache clean'", () => {
+  const cleanupCommand = (yarnProvider() as unknown as { cleanupCommand: string[] }).cleanupCommand;
+  assert.deepEqual(cleanupCommand, ["yarn", "cache", "clean"]);
+});
+
+test("bun provider's detect() reports unavailable when bun is absent, without throwing", async () => {
+  const detection = await bunProvider().detect();
+  if (detection.status !== "unavailable") { assert.equal(detection.status, "verified"); return; } // bun installed on this runner
+  assert.equal(detection.status, "unavailable");
+  assert.deepEqual(await bunProvider().discover(), []);
+});
+
+test("bun provider's cleanup command is exactly 'bun pm cache rm'", () => {
+  const cleanupCommand = (bunProvider() as unknown as { cleanupCommand: string[] }).cleanupCommand;
+  assert.deepEqual(cleanupCommand, ["bun", "pm", "cache", "rm"]);
+});
+
+test("pip provider's detect() reports verified when pip3 is on PATH, unavailable otherwise", async (t) => {
+  const detection = await pipProvider().detect();
+  if (detection.status === "unavailable") { t.skip("pip3 not installed on this machine"); return; }
+  // pip3 is confirmed installed on this dev machine (see report), so this is
+  // the branch actually exercised here. The "tool absent" code path is the
+  // same CommandProvider.detect() logic already covered by the synthetic
+  // "nope" tool test at the top of this file and the yarn/bun tests above.
+  assert.equal(detection.status, "verified");
+});
+
+test("pip provider's cleanup command is exactly 'pip3 cache purge'", async (t) => {
+  const candidates = await pipProvider().discover();
+  if (candidates.length === 0) { t.skip("pip3 not installed on this machine"); return; }
+  const [candidate] = candidates;
+  assert.equal(candidate.target.kind, "command");
+  if (candidate.target.kind === "command") assert.deepEqual(candidate.target.command, ["pip3", "cache", "purge"]);
 });
 
 // Points each tool's cache at a small, symlink-free temp directory via the
