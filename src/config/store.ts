@@ -7,7 +7,7 @@ import type { Category, ConfigFile, Policy } from "../core/types.js";
 
 const categories = new Set<Category>(["worktrees", "ai-history", "ai-caches", "package-caches", "project-dependencies", "project-environments", "build-artifacts"]);
 
-function validatePolicy(value: unknown): Policy {
+export function validatePolicy(value: unknown): Policy {
   if (!value || typeof value !== "object") throw new Error("invalid policy");
   const policy = value as Partial<Policy>;
   const safeCacheAgeDays = policy.safeCacheAgeDays;
@@ -26,7 +26,9 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     if (parsed.version !== 1 || !Array.isArray(parsed.roots)) throw new Error("invalid config");
     const policy = validatePolicy(parsed.policy);
     if (!parsed.roots.every((root) => typeof root === "string" && root.length > 0)) throw new Error("invalid roots");
-    return { version: 1, roots: parsed.roots.map((root) => absolutePath(root)), policy };
+    const config: ConfigFile = { version: 1, roots: parsed.roots.map((root) => absolutePath(root)), policy };
+    if (typeof parsed.allowProjectArtifacts === "boolean") config.allowProjectArtifacts = parsed.allowProjectArtifacts;
+    return config;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, roots: [], policy: { ...defaultPolicy } };
     throw error;
