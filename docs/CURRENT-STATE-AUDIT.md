@@ -1,5 +1,9 @@
 # Current state audit
 
+**Historical.** This audit was measured on 2026-09-04, before the repo had version control or CI. Most of the P0 findings below (F1, F4, F5, F7 partially, F8, F13, and others) have since been fixed; see [`IMPROVEMENT-PLAN.md`](IMPROVEMENT-PLAN.md) and the README for current status. Kept here as a record of what was found and when, not as a description of the tool today.
+
+Two findings below did not hold up on a later check against the same code path: **F1** (the symlinked-ancestor bug) — `projectRoots()` no longer has this shape, it canonicalizes each directory before recursing into it rather than comparing back to the un-resolved input, and a live run finds and lists project artifacts correctly. And the "1 failed" test count in section 1 — a full run of the current suite (133 tests) passes with zero failures; the failing test this section describes was fixed along with F1.
+
 Measured on 2026-09-04, macOS (Darwin 25.5.0), Node 20+, against the working tree at `~/Desktop/research`.
 
 Everything in this document was observed by running the code or reading it, not inferred. Where something was not verified it says so.
@@ -11,10 +15,10 @@ Everything in this document was observed by running the code or reading it, not 
 | Version | 0.1.0, unpublished |
 | Source | 31 TypeScript files, 2,245 lines |
 | Version control | **None.** Not a git repository, no history, no CI configuration |
-| `npm test` | 12 passed, 1 failed |
-| Failing test | `src/test/project-artifacts.test.ts`, the only test in that file |
+| `npm test` | 12 passed, 1 failed, at the time this was written |
+| Failing test | `src/test/project-artifacts.test.ts`, the only test in that file, at the time this was written |
 
-The failure is real and not a flaky test. `ProjectArtifactProvider.discover()` returns an empty set where the fixture expects three candidates:
+The failure was real at the time and not a flaky test. `ProjectArtifactProvider.discover()` returned an empty set where the fixture expected three candidates:
 
 ```
 + actual - expected
@@ -22,7 +26,7 @@ The failure is real and not a flaky test. `ProjectArtifactProvider.discover()` r
 - Set(3) { 'build-artifacts', 'project-dependencies', 'project-environments' }
 ```
 
-Root cause in section 3, finding F1.
+Root cause described in section 3, finding F1. **Since fixed:** the current suite (133 tests) passes in full, and `projectRoots()` no longer has the bug F1 describes — see the note at the top of this document.
 
 ## 2. The coverage gap, measured
 
@@ -63,7 +67,9 @@ The safety engineering is not the bottleneck. Coverage and default visibility ar
 
 Severity: **S1** breaks the product's core function, **S2** breaks a stated promise, **S3** correctness or maintenance debt.
 
-### F1 (S1) Project scanning returns zero results under any symlinked ancestor
+### F1 (S1) Project scanning returns zero results under any symlinked ancestor — FIXED, did not reproduce
+
+**Update:** rechecked against the current `projectRoots()` in `src/providers/project.ts`. It now calls `safeRealPath(current)` and recurses using the resolved path directly, rather than comparing the resolved path back against the un-resolved input and bailing on a mismatch. The symlinked-ancestor case (`os.tmpdir()` under `/var` resolving to `/private/var` on macOS) no longer aborts the walk. A live `agentclean scan --project-artifacts` run and the current test suite both confirm project artifacts are found normally. Original finding kept below for the record.
 
 `src/providers/project.ts`, `projectRoots()`. The walk calls `safeRealPath(current)` and returns early unless `samePath(resolved, current)`. On macOS, `os.tmpdir()` resolves to `/var/folders/...`, whose real path is `/private/var/folders/...`. The two differ, so the walk aborts at the root and finds nothing.
 
@@ -263,7 +269,7 @@ For a tool whose entire pitch is fail-closed, the final `rm` should re-assert th
 | "macOS launch agents; Linux systemd user timers" | Windows only. See F7. |
 | "does not include raw provider command output" | See F18. |
 | "positive ownership evidence" for project artifacts | See F5. |
-| `npm test` presented as a working dev loop | Currently 1 failing test. See section 1. |
+| `npm test` presented as a working dev loop | Was 1 failing test at the time of this audit (section 1). Since fixed: the current suite (133 tests) passes in full. |
 
 ### F22 (S2) Test coverage does not cover the safety claims
 
