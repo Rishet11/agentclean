@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tgz
+agentclean-policy.json
+.DS_Store
+coverage/

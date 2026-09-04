@@ -1,0 +1,29 @@
+{
+  "name": "agentclean",
+  "version": "0.1.0",
+  "description": "Fail-closed storage cleanup for AI coding tools and Git worktrees.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agentclean": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "docs/",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "pack:check": "npm run build && npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
