@@ -24,7 +24,8 @@ jobs:
     env:
       # Keep the worktree fixtures away from runner-level git config, which
       # otherwise perturbs init.defaultBranch and core.autocrlf on Windows.
-      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/agentclean-gitconfig
+      # RUNNER_TEMP is an environment variable, unlike the runner.* context,
+      # which is not resolvable in a job-level env block.
       GIT_TERMINAL_PROMPT: "0"
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +38,8 @@ jobs:
       - name: Prepare isolated git config
         shell: bash
         run: |
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/agentclean-gitconfig" >> "$GITHUB_ENV"
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/agentclean-gitconfig"
           : > "$GIT_CONFIG_GLOBAL"
           git config --global user.email ci@example.invalid
           git config --global user.name "AgentClean CI"
