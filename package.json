@@ -2,7 +2,31 @@
   "name": "agentclean",
   "version": "0.1.0",
   "description": "Fail-closed storage cleanup for AI coding tools and Git worktrees.",
+  "keywords": [
+    "cleanup",
+    "disk-space",
+    "cache",
+    "node_modules",
+    "git-worktree",
+    "ai-tools",
+    "claude-code",
+    "codex",
+    "cursor",
+    "npm-cache",
+    "pnpm",
+    "uv",
+    "storage"
+  ],
+  "homepage": "https://github.com/Rishet11/agentclean#readme",
+  "bugs": {
+    "url": "https://github.com/Rishet11/agentclean/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rishet11/agentclean.git"
+  },
   "license": "MIT",
+  "author": "Rishet Mehra",
   "type": "module",
   "bin": {
     "agentclean": "dist/cli.js"
