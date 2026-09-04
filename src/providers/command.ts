@@ -49,6 +49,7 @@ export class CommandProvider implements StorageProvider {
       eligible: true,
       blockers: [],
       autoSafe: this.autoSafe,
+      partialMeasurement: measured.partial,
       metadata: { path: resolved },
     }];
   }

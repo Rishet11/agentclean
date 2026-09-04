@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,12 +17,14 @@ test("samePath compares drive-like paths case-insensitively only on Windows", ()
   assert.equal(samePath(left, right), process.platform === "win32");
 });
 
-test("measure and remove refuse symlinks", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "agentclean-"));
-  const outside = await mkdtemp(path.join(os.tmpdir(), "agentclean-outside-"));
+test("measure and remove refuse a symlinked root", async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-")));
+  const outside = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-outside-")));
   await writeFile(path.join(outside, "secret.txt"), "secret");
   const link = path.join(root, "link");
   await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
+  // measureTree only refuses the root itself; a symlink inside a measured tree is a
+  // 0-byte entry that is not descended into (covered in measure.test.ts).
   await assert.rejects(measureTree(link), /reparse-point/);
   await assert.rejects(removeTree(link), /reparse-point/);
 });

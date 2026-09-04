@@ -68,6 +68,7 @@ export class GitWorktreeProvider implements StorageProvider {
         if (!exists) blockers.push("path-missing");
         let measured;
         if (exists) measured = await measureTree(target).catch(() => undefined);
+        if (exists && !measured) blockers.push("unmeasurable");
         const worktreeStatus = exists ? await status(target) : "";
         if (worktreeStatus.trim()) blockers.push("dirty-or-untracked");
         const submodules = exists ? await runCommand(["git", "submodule", "status"], target, 20_000).catch(() => undefined) : undefined;
@@ -90,6 +91,7 @@ export class GitWorktreeProvider implements StorageProvider {
           eligible: blockers.length === 0,
           blockers,
           autoSafe: false,
+          partialMeasurement: measured?.partial,
           metadata: { repo, branch: entry.branch || "detached", worktreePath: target },
         });
       }
@@ -117,7 +119,9 @@ export class GitWorktreeProvider implements StorageProvider {
     const currentStats = await lstat(target).catch(() => undefined);
     if (!currentStats || !candidate.fingerprint || currentStats.mtimeMs !== candidate.fingerprint.mtimeMs || currentStats.size !== candidate.fingerprint.size) return { ok: false, reason: "changed-since-scan" };
     const measured = await measureTree(target).catch(() => undefined);
-    if (!measured || measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
+    if (!measured) return { ok: false, reason: "contents-changed-since-scan" };
+    if (measured.partial) return { ok: false, reason: "partial-measurement" };
+    if (measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
     return { ok: true };
   }
 

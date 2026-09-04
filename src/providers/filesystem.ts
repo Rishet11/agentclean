@@ -60,9 +60,9 @@ export class FilesystemProvider implements StorageProvider {
         }
         if (stats.isSymbolicLink()) continue;
         const measured = await measureTree(target).catch(() => undefined);
-        if (!measured) continue;
         const ageDays = Math.max(0, (context.now - stats.mtimeMs) / 86_400_000);
         const blockers = ageDays < rule.minAgeDays ? [`younger-than-${rule.minAgeDays}-days`] : [];
+        if (!measured) blockers.push("unmeasurable");
         candidates.push({
           id: hashValue({ provider: this.id, target, category: rule.category }).slice(0, 16),
           provider: this.id,
@@ -72,13 +72,14 @@ export class FilesystemProvider implements StorageProvider {
           target: { kind: "path", path: target },
           reason: `${rule.reason}: ${name}`,
           evidence: [`documented root ${rule.relativePath}`, "direct child of provider-owned directory"],
-          bytes: measured.bytes,
-          fileCount: measured.fileCount,
+          bytes: measured?.bytes ?? 0,
+          fileCount: measured?.fileCount ?? 0,
           mtimeMs: stats.mtimeMs,
           fingerprint: fingerprintFromStats(stats),
           eligible: blockers.length === 0,
           blockers,
           autoSafe: rule.autoSafe,
+          partialMeasurement: measured?.partial,
           metadata: { root, relativePath: rule.relativePath, minAgeDays: rule.minAgeDays },
         });
       }
@@ -115,7 +116,9 @@ export class FilesystemProvider implements StorageProvider {
       return { ok: false, reason: "changed-since-scan" };
     }
     const measured = await measureTree(targetPath).catch(() => undefined);
-    if (!measured || measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
+    if (!measured) return { ok: false, reason: "contents-changed-since-scan" };
+    if (measured.partial) return { ok: false, reason: "partial-measurement" };
+    if (measured.bytes !== candidate.bytes || measured.fileCount !== candidate.fileCount) return { ok: false, reason: "contents-changed-since-scan" };
     return { ok: true };
   }
 
