@@ -1,5 +1,5 @@
 import { emitKeypressEvents } from "node:readline";
-import { formatBytes } from "../core/output.js";
+import { formatBytes, humanReason, plainRestore, shortLabel } from "../core/output.js";
 import type { ReportRow, ReportModel } from "../core/report.js";
 import type { RestoreTier } from "../core/types.js";
 import { tierLabel } from "../core/tiers.js";
@@ -154,7 +154,7 @@ export async function runChecklist(model: ReportModel, io: ChecklistIO): Promise
     }
     const row = item.row;
     if (!isRowEligible(row)) {
-      message = `blocked: ${row.blockers.join(", ") || "not eligible"}`;
+      message = `kept: ${row.blockers.map(humanReason).join(", ") || "not eligible"}`;
       return;
     }
     const nowSelected = !rowFullySelected(row, selected);
@@ -187,12 +187,12 @@ export async function runChecklist(model: ReportModel, io: ChecklistIO): Promise
     const marker = focused ? ">   " : "    ";
     const symbol = rowSymbol(row, selected);
     const size = padRight(formatBytes(row.bytes), 10);
-    const method = padRight(truncateToWidth(row.restoreMethod || "(no restore path)", 28), 28);
+    const method = padRight(truncateToWidth(plainRestore(row) || "cannot be undone", 28), 28);
     const time = padRight(`~${formatDuration(row.restoreSeconds)}`, 6);
     const suffix = row.count > 1 ? ` (x${row.count})` : "";
-    const label = `${truncateToWidth(row.label, 40)}${suffix}`;
+    const label = `${truncateToWidth(shortLabel(row), 40)}${suffix}`;
     const line = `${marker}${symbol} ${size} ${method} ${time} ${label}`;
-    if (!isRowEligible(row)) return dim(`${line}  [blocked: ${row.blockers.join(", ")}]`, colorOn);
+    if (!isRowEligible(row)) return dim(`${line}  [kept: ${row.blockers.map(humanReason).join(", ")}]`, colorOn);
     return line;
   }
 

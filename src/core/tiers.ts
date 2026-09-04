@@ -160,9 +160,9 @@ export function tierRank(tier: RestoreTier): number {
 }
 
 export const tierLabel: Record<RestoreTier, string> = {
-  free: "Free to rebuild",
-  cheap: "Cheap to restore",
-  irreplaceable: "Irreplaceable",
+  free: "Safe to remove",
+  cheap: "Comes back when needed",
+  irreplaceable: "Gone for good",
 };
 
 export const tierSentence: Record<RestoreTier, string> = {

@@ -47,17 +47,55 @@ function rowLine(row: ReportRow, colorOn: boolean): string {
  * `--json` output is wired separately (at merge time) to the same
  * `buildReport` call, so the two views are always in sync.
  */
-/** Friendly one- or two-word name for a row, instead of a full command or path. */
-function shortLabel(row: { provider: string; category: string; label: string; path?: string }): string {
-  const caches: Record<string, string> = { uv: "uv cache", npm: "npm cache", pnpm: "pnpm store", go: "go modules", pip: "pip cache", yarn: "yarn cache", bun: "bun cache" };
-  if (caches[row.provider]) return caches[row.provider];
-  if (row.provider === "git") return `worktree ${basenameOf(row.label)}`;
-  if (row.category === "build-artifacts") return "build output";
-  if (row.category === "project-dependencies") return "node_modules";
-  if (row.category === "project-environments") return "virtualenv";
-  if (row.category === "ai-history") return "chat history";
-  if (row.category === "ai-caches") return `${row.provider} cache`;
-  return basenameOf(row.label);
+/**
+ * What a row is, in words a person who has never heard of pnpm can act on.
+ * "uv cache" and "go modules" are meaningless to most people; "Python packages
+ * you downloaded before" is not.
+ */
+export function shortLabel(row: { provider: string; category: string; label: string }): string {
+  const downloads: Record<string, string> = {
+    uv: "Python downloads",
+    pip: "Python downloads",
+    npm: "JavaScript downloads",
+    pnpm: "JavaScript downloads",
+    yarn: "JavaScript downloads",
+    bun: "JavaScript downloads",
+    go: "Go downloads",
+  };
+  if (downloads[row.provider]) return downloads[row.provider];
+  if (row.provider === "git") return `spare copy of ${basenameOf(row.label)}`;
+  switch (row.category) {
+    case "build-artifacts": return `build files, ${projectOf(row.label)}`;
+    case "project-dependencies": return `packages for ${projectOf(row.label)}`;
+    case "project-environments": return `Python setup for ${projectOf(row.label)}`;
+    case "ai-history": return "past conversations";
+    case "ai-caches": return `${friendlyProvider(row.provider)} leftovers`;
+    default: return basenameOf(row.label);
+  }
+}
+
+function friendlyProvider(provider: string): string {
+  switch (provider) {
+    case "claude": return "Claude Code";
+    case "codex": return "Codex";
+    case "cursor": return "Cursor";
+    case "opencode": return "OpenCode";
+    case "antigravity": return "Antigravity";
+    case "gemini": return "Gemini";
+    default: return provider;
+  }
+}
+
+/** Keep a cell inside its column, trimming the front so the distinctive tail survives. */
+function fit(value: string, width: number): string {
+  return value.length <= width ? value : `\u2026${value.slice(value.length - width + 1)}`;
+}
+
+/** "…/faraway/spaceatc/frontend/dist" -> "spaceatc/frontend", the bit a person recognises. */
+function projectOf(value: string): string {
+  const parts = value.replace(/\s+refs\/heads\/.*$/, "").trim().split(/[\\/]/).filter(Boolean);
+  const withoutArtifact = parts.slice(0, -1);
+  return withoutArtifact.slice(-2).join("/") || basenameOf(value);
 }
 
 function basenameOf(value: string): string {
@@ -81,7 +119,7 @@ export function printSummary(plan: Plan, output: NodeJS.WritableStream): void {
 
   const eligible = model.rows.filter((row) => row.eligible).slice(0, 5);
   for (const row of eligible) {
-    output.write(`    ${padRight(formatBytes(row.bytes), 8)} ${padRight(shortLabel(row), 17)} ${dim(row.restoreMethod || "", colorOn)}\n`);
+    output.write(`    ${padRight(formatBytes(row.bytes), 8)} ${padRight(fit(shortLabel(row), 26), 26)} ${dim(plainRestore(row), colorOn)}\n`);
   }
   const restCount = model.rows.filter((row) => row.eligible).length - eligible.length;
   const restBytes = model.eligibleBytes - eligible.reduce((sum, row) => sum + row.bytes, 0);
@@ -96,8 +134,22 @@ export function printSummary(plan: Plan, output: NodeJS.WritableStream): void {
   output.write(`  ${bold("agentclean scan -v", colorOn)}    full detail\n\n`);
 }
 
+/** The restore command matters to a developer; "what happens" matters to everyone. */
+export function plainRestore(row: { provider: string; category: string; restoreMethod: string; tier: string }): string {
+  if (row.tier === "irreplaceable") return "cannot be undone";
+  switch (row.category) {
+    case "package-caches": return "downloaded again when needed";
+    case "build-artifacts": return "remade next time you build";
+    case "project-dependencies": return "reinstalled with one command";
+    case "project-environments": return "rebuilt from your requirements file";
+    case "worktrees": return "your commits are kept";
+    case "ai-caches": return "the app makes these again";
+    default: return row.restoreMethod || "";
+  }
+}
+
 /** Blocker ids are precise; this is what a person would say instead. */
-function humanReason(reason: string): string {
+export function humanReason(reason: string): string {
   if (reason.startsWith("younger-than")) return "recently used";
   switch (reason) {
     case "history-requires-explicit-opt-in": return "chat history";

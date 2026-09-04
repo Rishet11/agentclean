@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { tierLabel } from "../core/tiers.js";
+import { humanReason } from "../core/output.js";
 import { PassThrough } from "node:stream";
 import { runChecklist } from "../ui/checklist.js";
 import type { ChecklistIO } from "../ui/checklist.js";
@@ -115,11 +117,13 @@ test("pre-ticks free and cheap tiers, never irreplaceable; the first rendered fr
   const donePromise = runChecklist(fixtureModel(), io);
   await delay(10); // let the initial frame render before any key arrives
 
-  const firstFrame = frames.find((frame) => frame.includes("Free to rebuild"));
+  const firstFrame = frames.find((frame) => frame.includes(tierLabel.free));
   assert.ok(firstFrame, "expected a rendered frame before any keypress");
-  assert.match(firstFrame, /\[x\].*Free to rebuild/);
-  assert.match(firstFrame, /\[x\].*Cheap to restore/);
-  assert.match(firstFrame, /\[ \].*Irreplaceable/);
+  // Reference tierLabel rather than the wording, so renaming a label for
+  // readability can never quietly turn the irreplaceable tier on by default.
+  assert.match(firstFrame, new RegExp(`\\[x\\].*${tierLabel.free}`));
+  assert.match(firstFrame, new RegExp(`\\[x\\].*${tierLabel.cheap}`));
+  assert.match(firstFrame, new RegExp(`\\[ \\].*${tierLabel.irreplaceable}`));
 
   await press(io, "\r");
   const result = await donePromise;
@@ -172,7 +176,7 @@ test("a history-requires-explicit-opt-in row cannot be selected by any key seque
 
   const beforeSpace = frames.length;
   await press(io, " "); // try to toggle it directly
-  assert.ok(frames.slice(beforeSpace).some((frame) => frame.includes("blocked") && frame.includes("history-requires-explicit-opt-in")));
+  assert.ok(frames.slice(beforeSpace).some((frame) => frame.includes("kept") && frame.includes(humanReason("history-requires-explicit-opt-in"))));
 
   await press(io, "a"); // try the group toggle for its tier
   await press(io, "f"); // try free-only (should not touch it)

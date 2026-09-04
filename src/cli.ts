@@ -10,7 +10,10 @@ import { makeContext, makeContextWithDiscoveredRoots } from "./core/context.js";
 import { EXIT_FATAL, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE } from "./core/errors.js";
 import { executePlan } from "./core/executor.js";
 import { autoPlan } from "./core/auto.js";
-import { loadPlan, savePlan } from "./core/plan.js";
+import { createPlan, loadPlan, savePlan } from "./core/plan.js";
+import { buildReport } from "./core/report.js";
+import { runChecklist } from "./ui/checklist.js";
+import { formatBytes } from "./core/output.js";
 import { printPlan, printProviders, printResult, printSummary } from "./core/output.js";
 import { scanProviders } from "./core/scan.js";
 import { providerMap, providers } from "./providers/registry.js";
@@ -86,10 +89,11 @@ function readVersion(): string {
   }
 }
 
-async function askConfirmation(count: number): Promise<boolean> {
+async function askConfirmation(count: number, bytes?: number): Promise<boolean> {
   if (!stdin.isTTY || !stdout.isTTY) throw new Error("interactive confirmation required; use --plan <file> --yes for automation");
   const reader = createInterface({ input: stdin, output: stdout });
-  try { return (await reader.question(`Delete ${count} approved item(s)? This cannot be undone. [y/N] `)).trim().toLowerCase() === "y"; } finally { reader.close(); }
+  const size = bytes === undefined ? "" : ` (${formatBytes(bytes)})`;
+  try { return (await reader.question(`Remove ${count} item(s)${size}? This cannot be undone. [y/N] `)).trim().toLowerCase() === "y"; } finally { reader.close(); }
 }
 
 /**
@@ -141,10 +145,33 @@ async function runClean(options: Options, autoOnly = false): Promise<number> {
   }
   const guard = requiresExplicitPlan({ autoOnly, yes: options.yes, plan: options.plan, category: options.category, provider: options.provider, isTty: Boolean(stdin.isTTY && stdout.isTTY) });
   if (!guard.ok) throw new UsageError(guard.message);
+  let toExecute = selected;
   if (!autoOnly && !options.yes) {
-    if (!(await askConfirmation(eligible.length))) return EXIT_OK;
+    // A single all-or-nothing y/N over everything eligible is not a decision a
+    // person can actually make. Offer the list and let them choose per item.
+    const choice = await runChecklist(buildReport(selected), { stdin, stdout });
+    if (choice.aborted) {
+      stdout.write("Nothing removed.\n");
+      return EXIT_OK;
+    }
+    const chosen = selected.candidates.filter((candidate) => choice.selectedIds.has(candidate.id));
+    if (chosen.length === 0) {
+      stdout.write("Nothing selected, nothing removed.\n");
+      return EXIT_OK;
+    }
+    toExecute = createPlan(chosen, selected.roots, context.now, {
+      policyHash: selected.policyHash,
+      platform: selected.platform,
+      home: selected.home,
+      providerIds: selected.providerIds,
+    });
+    const total = chosen.reduce((sum, candidate) => sum + candidate.bytes, 0);
+    if (!(await askConfirmation(chosen.length, total))) {
+      stdout.write("Nothing removed.\n");
+      return EXIT_OK;
+    }
   }
-  const result = await executePlan(selected, map, { ...context, dryRun: false }, { dryRun: false, strict: options.strict, forceUnlock: options.forceUnlock });
+  const result = await executePlan(toExecute, map, { ...context, dryRun: false }, { dryRun: false, strict: options.strict, forceUnlock: options.forceUnlock });
   if (options.json) await writeOutput({ plan: selected, result }, options);
   else printResult(result, stdout);
   return cleanExitCode(result);
