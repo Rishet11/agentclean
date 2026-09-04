@@ -19,7 +19,14 @@ async function seedLock(runDir: string, owner?: Partial<LockOwner>): Promise<str
   return lockPath;
 }
 
-test("EPERM on pid 1 signals alive (verifies the ESRCH-only-means-dead assumption)", () => {
+// pid 1 is init on POSIX and is owned by root, so signalling it from an
+// unprivileged process raises EPERM, which is what makes it a usable probe
+// for "the process exists but is not ours". Windows has no pid 1 at all, so
+// process.kill(1, 0) raises ESRCH there and the probe means nothing. The
+// implementation is unaffected: ESRCH-only-means-dead is correct on both.
+const posixOnly = { skip: process.platform === "win32" ? "pid 1 is POSIX-specific" : false };
+
+test("EPERM on pid 1 signals alive (verifies the ESRCH-only-means-dead assumption)", posixOnly, () => {
   assert.equal(isProcessAlive(1), true);
 });
 
@@ -29,7 +36,7 @@ test("a lock owned by a live pid is not stolen", async () => {
   await assert.rejects(withExecutionLock(runDir, async () => "ran"), /another cleanup run is active/);
 });
 
-test("an EPERM pid (pid 1) is treated as alive, not reclaimed", async () => {
+test("an EPERM pid (pid 1) is treated as alive, not reclaimed", posixOnly, async () => {
   const runDir = await tempRunDir();
   await seedLock(runDir, { pid: 1, hostname: os.hostname() });
   await assert.rejects(withExecutionLock(runDir, async () => "ran"), /another cleanup run is active/);
