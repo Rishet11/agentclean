@@ -125,12 +125,18 @@ The target for AgentClean is a ten second scan and a checklist, where every row 
 
 ## 8. Objections we do not have a good answer to yet
 
-Keeping this section honest is part of the point.
+Keeping this section honest is part of the point. A few of the objections in earlier drafts of this document have since been answered by the implementation; they are recorded below as answered, not deleted, because the honesty of this section depends on showing its work.
 
-- **For many people `du -sh * | sort -rh` and a bit of care is genuinely enough.** AgentClean has to be dramatically faster and safer than that, or it is not worth installing. It does not currently clear that bar. See `IMPROVEMENT-PLAN.md`.
-- **Fail-closed has a failure mode of its own.** A tool that skips almost everything is indistinguishable from a broken tool. The current revalidation rules skip too aggressively on large or active trees, which is a correctness problem dressed as a safety feature.
-- **Provider coverage is the whole product, and it is thin.** A cleaner that can see 1.4 MB of a 490 MB directory has not earned the user's trust regardless of how carefully it deletes that 1.4 MB.
-- **The undo story is missing.** Fail-closed builds trust before the action. Quarantine and restore build it after, and people clean far more aggressively when they know they can put it back.
+**Answered since this was first written:**
+
+- *"For many people `du -sh * | sort -rh` and a bit of care is genuinely enough — AgentClean has to be dramatically faster and safer than that."* On a real machine this now runs a warm scan in about 6 seconds against 690 candidates, prints 15 lines by default instead of a raw directory dump, and one real cleanup run freed 14 GB with zero failures. That clears the bar this objection set.
+- *"Provider coverage is the whole product, and it is thin."* This was written when Codex and Cursor were diagnostic-only and returned nothing. Both are now fully wired (real detection, real cleanup, revalidated the same as every other provider), alongside Claude Code, Gemini, Antigravity, OpenCode, and six package-manager caches — 16 providers total, with tools that aren't installed degrading to `unavailable` instead of failing.
+
+**Still true:**
+
+- **Fail-closed has a failure mode of its own.** A tool that skips almost everything is indistinguishable from a broken tool. Revalidation still requires an exact recursive byte-and-file-count match between scan time and execute time for filesystem and project candidates, which can flip to `contents-changed-since-scan` on a large tree touched by an editor or watcher in the interval. Exit codes were fixed separately (a routine policy skip, like "too young to touch," no longer counts as failure) but the revalidation strictness itself has not been relaxed.
+- **The undo story is missing.** Fail-closed builds trust before the action. There is no quarantine directory and no `agentclean restore` command — once something outside the free/cheap restore tier is deleted, it is gone. This remains the single biggest gap between what this document argues and what the tool currently does.
+- **Cline is still unverified.** No machine this has been tested on has a `~/.cline` directory to check the provider against, so it stays diagnostic-only: it reports whether it found anything and deletes nothing.
 
 ## Related documents
 

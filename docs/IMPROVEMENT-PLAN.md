@@ -1,5 +1,7 @@
 # Improvement plan: making AgentClean useful to humans
 
+**Largely historical.** This was written against the state described in [`CURRENT-STATE-AUDIT.md`](CURRENT-STATE-AUDIT.md) on 2026-09-04. Most of P0 is done — CI exists, the symlinked-root bug and the lockfile check are fixed, exit codes no longer treat a routine skip as failure, project artifacts are visible without a flag, and the four worktree protections have real tests. The restore-cost model, the interactive checklist, and per-provider coverage (P1.1, P1.4, P2.1) are also built and documented in the README. Quarantine/restore (P1.3), cross-platform scheduling (P2.5), and the MCP server (P3.1) are not built yet — those parts of this plan are still current. Read this as a snapshot of what was proposed and check the README and source for what actually landed.
+
 Goal of this document: turn AgentClean from a correct-but-invisible safety engine into something a developer installs, runs, and keeps. It is written to be worked through in order.
 
 The companion documents are [`CURRENT-STATE-AUDIT.md`](CURRENT-STATE-AUDIT.md) for measured facts about the implementation and [`WHY-NOT-JUST-ASK-AN-AI.md`](WHY-NOT-JUST-ASK-AN-AI.md) for positioning.

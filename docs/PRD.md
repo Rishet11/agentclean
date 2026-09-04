@@ -205,11 +205,11 @@ Initial provider matrix:
 | Git | `git worktree list --porcelain -z`, `git status --porcelain=v2` | Clean linked worktrees and selected Git metadata actions | Main worktree, dirty, locked, active, submodule, and ambiguous trees are protected |
 | Claude Code | Maintained application-data documentation and `CLAUDE_CONFIG_DIR` | Documented disposable data | Auth, settings, plugins, memory, and project state protected |
 | Gemini CLI | Maintained configuration and session-data documentation | Documented temporary/session data only when classified disposable | `.gemini` project instructions/settings protected |
-| Cline | Maintained `~/.cline`, `CLINE_DATA_DIR` layout | Explicitly documented disposable data | Sessions and SQLite state are history/data by default |
+| Cline | Maintained `~/.cline`, `CLINE_DATA_DIR` layout | Diagnostic-only — no verified install has been found on any tested machine, so it does not delete anything yet | Sessions and SQLite state would be history/data by default once implemented |
 | OpenCode | Maintained Windows storage/cache documentation | Documented cache actions | Auth, project storage, and plugins protected |
-| Codex | Maintained official source/docs required | Diagnostic-only until verified | Issue reports are not deletion authority |
-| Cursor | Maintained official source/docs required | Diagnostic-only until verified | Community reports are research leads only |
-| npm | `npm config get cache` and npm cache commands | Provider command | Prefer npm verify/clean semantics over direct cache deletion |
+| Codex | Documented `~/.codex` data root | Documented disposable data; session transcripts are report-only | Implemented — no longer diagnostic-only |
+| Cursor | Documented platform app-support root | Documented disposable data | Implemented — no longer diagnostic-only |
+| npm | `npm config get cache` and `npm cache clean --force` | Provider command | Only the clean command is wired; there is no `npm cache verify` step |
 | pnpm | `pnpm store path` and pnpm store commands | Provider command | `pnpm store prune` removes unreferenced packages |
 
 ## 10. Git worktree requirements
