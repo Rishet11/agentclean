@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    env:
+      # Keep the worktree fixtures away from runner-level git config, which
+      # otherwise perturbs init.defaultBranch and core.autocrlf on Windows.
+      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/agentclean-gitconfig
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Prepare isolated git config
+        shell: bash
+        run: |
+          : > "$GIT_CONFIG_GLOBAL"
+          git config --global user.email ci@example.invalid
+          git config --global user.name "AgentClean CI"
+          git config --global init.defaultBranch main
+          git config --global protocol.file.allow always
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run pack:check
+
+      # The test script used to be a shell glob, which cmd.exe does not expand,
+      # so this leg would have been green while running nothing. Assert a
+      # non-zero test count so that failure mode cannot come back.
+      - name: Assert tests actually ran
+        shell: bash
+        run: |
+          count=$(node scripts/run-tests.mjs 2>&1 | grep -E '^# tests ' | awk '{print $3}')
+          echo "test count: ${count:-0}"
+          test "${count:-0}" -gt 0

@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/",
+    "!dist/test/",
     "README.md",
     "docs/",
     "LICENSE"
@@ -16,7 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/test/*.test.js",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "pack:check": "npm run build && npm pack --dry-run"
   },
   "engines": {
