@@ -14,6 +14,7 @@ interface ArtifactRule {
 }
 
 const packageLocks = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
+const pythonRequirements = ["requirements.txt", "pyproject.toml", "uv.lock", "Pipfile", "poetry.lock", "setup.py"];
 const projectMarkers = ["package.json", "pyproject.toml", "requirements.txt", "Pipfile", "setup.py", "Cargo.toml", "go.mod", "pom.xml", "build.gradle"];
 const ignoredDirectories = new Set([".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "vendor", "target"]);
 
@@ -22,21 +23,31 @@ const rules: ArtifactRule[] = [
   { name: ".venv", category: "project-environments", reason: "Python virtual environment", minAgeDays: 14, evidence: ["Python project marker", "pyvenv.cfg"] },
   { name: "venv", category: "project-environments", reason: "Python virtual environment", minAgeDays: 14, evidence: ["Python project marker", "pyvenv.cfg"] },
   { name: "env", category: "project-environments", reason: "Python virtual environment", minAgeDays: 14, evidence: ["Python project marker", "pyvenv.cfg"] },
-  { name: "dist", category: "build-artifacts", reason: "generated build output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: "build", category: "build-artifacts", reason: "generated build output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: ".next", category: "build-artifacts", reason: "generated Next.js output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: "out", category: "build-artifacts", reason: "generated export output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: "target", category: "build-artifacts", reason: "generated build output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: "coverage", category: "build-artifacts", reason: "generated test coverage output", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
-  { name: ".turbo", category: "build-artifacts", reason: "rebuildable Turborepo cache", minAgeDays: 7, evidence: ["recognized project root", "known build directory"] },
+  { name: "dist", category: "build-artifacts", reason: "generated build output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: "build", category: "build-artifacts", reason: "generated build output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: ".next", category: "build-artifacts", reason: "generated Next.js output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: "out", category: "build-artifacts", reason: "generated export output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: "target", category: "build-artifacts", reason: "generated build output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: "coverage", category: "build-artifacts", reason: "generated test coverage output", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
+  { name: ".turbo", category: "build-artifacts", reason: "rebuildable Turborepo cache", minAgeDays: 0, evidence: ["recognized project root", "known build directory"] },
 ];
 
 function hasFile(root: string, name: string): Promise<boolean> {
   return lstat(path.join(root, name)).then((stats) => stats.isFile()).catch(() => false);
 }
 
+async function hasEntry(root: string, name: string): Promise<boolean> {
+  return lstat(path.join(root, name)).then(() => true).catch(() => false);
+}
+
+/** Returns the first of `names` present in `root`, so the caller can name it. */
+async function firstPresent(root: string, names: string[]): Promise<string | undefined> {
+  const present = await Promise.all(names.map((name) => hasFile(root, name)));
+  return names[present.findIndex(Boolean)];
+}
+
 async function isProjectRoot(root: string): Promise<boolean> {
-  if (await hasFile(root, ".git")) return true;
+  if (await hasEntry(root, ".git")) return true;
   for (const marker of projectMarkers) if (await hasFile(root, marker)) return true;
   return false;
 }
@@ -93,7 +104,7 @@ export class ProjectArtifactProvider implements StorageProvider {
   }
 
   async discover(context: ExecuteContext): Promise<Candidate[]> {
-    if (!context.allowProjectArtifacts) return [];
+    if (context.reportProjectArtifacts === false) return [];
     const output: Candidate[] = [];
     for (const root of await projectRoots(context.roots)) {
       const children = await immediateChildren(root).catch(() => []);
@@ -104,8 +115,10 @@ export class ProjectArtifactProvider implements StorageProvider {
         const stats = await lstat(target).catch(() => undefined);
         if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) continue;
         for (const rule of matchingRules) {
-          if (rule.category === "project-dependencies" && (!(await hasFile(root, "package.json")) || !(await packageLocks.some((lock) => hasFile(root, lock))))) continue;
+          const lockfile = rule.category === "project-dependencies" ? await firstPresent(root, packageLocks) : undefined;
+          if (rule.category === "project-dependencies" && (!(await hasFile(root, "package.json")) || !lockfile)) continue;
           if (rule.category === "project-environments" && !(await isPythonEnvironment(target))) continue;
+          const requirementsFile = rule.category === "project-environments" ? await firstPresent(root, pythonRequirements) : undefined;
           const measured = await measureTree(target).catch(() => undefined);
           const ageDays = Math.max(0, (context.now - stats.mtimeMs) / 86_400_000);
           const blockers = ageDays < rule.minAgeDays ? [`younger-than-${rule.minAgeDays}-days`] : [];
@@ -128,7 +141,13 @@ export class ProjectArtifactProvider implements StorageProvider {
             blockers,
             autoSafe: false,
             partialMeasurement: measured?.partial,
-            metadata: { projectRoot: root, artifactName: name, minAgeDays: rule.minAgeDays },
+            metadata: {
+              projectRoot: root,
+              artifactName: name,
+              minAgeDays: rule.minAgeDays,
+              ...(rule.category === "project-dependencies" ? { hasLockfile: Boolean(lockfile), ...(lockfile ? { lockfile } : {}) } : {}),
+              ...(rule.category === "project-environments" ? { hasRequirements: Boolean(requirementsFile), ...(requirementsFile ? { requirementsFile } : {}) } : {}),
+            },
           });
         }
       }
@@ -154,7 +173,7 @@ export class ProjectArtifactProvider implements StorageProvider {
     if (!fingerprintMatches(candidate, stats)) return { ok: false, reason: "changed-since-scan" };
     if (Math.max(0, (context.now - stats.mtimeMs) / 86_400_000) < minimumAge) return { ok: false, reason: `younger-than-${minimumAge}-days` };
     if (isWithin(target, context.cwd)) return { ok: false, reason: "current-directory" };
-    if (artifactName === "node_modules" && (!(await hasFile(root, "package.json")) || !(await packageLocks.some((lock) => hasFile(root, lock))))) return { ok: false, reason: "package lock evidence missing" };
+    if (artifactName === "node_modules" && (!(await hasFile(root, "package.json")) || !(await firstPresent(root, packageLocks)))) return { ok: false, reason: "package lock evidence missing" };
     if ([".venv", "venv", "env"].includes(artifactName) && !(await isPythonEnvironment(target))) return { ok: false, reason: "Python environment marker missing" };
     const measured = await measureTree(target).catch(() => undefined);
     if (!measured) return { ok: false, reason: "contents-changed-since-scan" };
