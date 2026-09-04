@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { loadConfig, saveConfig } from "./config/store.js";
-import { makeContext } from "./core/context.js";
+import { makeContext, makeContextWithDiscoveredRoots } from "./core/context.js";
 import { EXIT_FATAL, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE } from "./core/errors.js";
 import { executePlan } from "./core/executor.js";
 import { autoPlan } from "./core/auto.js";
@@ -111,7 +111,7 @@ async function writeOutput(value: unknown, options: Options, output: NodeJS.Writ
 
 async function runScan(options: Options, autoOnly = false): Promise<number> {
   const config = await loadConfig();
-  const context = makeContext(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
+  const context = await makeContextWithDiscoveredRoots(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
   const map = providerMap();
   const plan = await scanProviders([...map.values()], context, { category: options.category, provider: options.provider });
   const filtered = autoOnly ? autoPlan(plan, config.policy, context.now) : plan;
@@ -123,7 +123,7 @@ async function runScan(options: Options, autoOnly = false): Promise<number> {
 
 async function runClean(options: Options, autoOnly = false): Promise<number> {
   const config = await loadConfig();
-  const context = makeContext(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
+  const context = await makeContextWithDiscoveredRoots(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
   const map = providerMap();
   if (autoOnly && options.plan) throw new UsageError("auto mode always scans a fresh plan; --plan is not allowed");
   const plan = options.plan ? await loadPlan(path.resolve(options.plan)) : await scanProviders([...map.values()], context, { category: options.category, provider: options.provider });
