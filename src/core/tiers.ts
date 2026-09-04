@@ -135,7 +135,12 @@ export function restoreCostFor(candidate: Candidate): RestoreCost {
       const branch = metaString(candidate, "branch") || "<branch>";
       const base = `git worktree add ${worktreePath} ${branch}`;
       const unpushed = metaNumber(candidate, "unpushedCommits");
-      const method = unpushed && unpushed > 0 ? `WARNING: ${unpushed} unpushed commit(s) will be lost. ${base}` : base;
+      // Do not say the commits will be lost: git worktree remove deletes the
+      // working copy and git's bookkeeping for it, never the branch or its
+      // objects, which live in the shared .git and come back with the command
+      // above. What is worth saying is that they exist on no remote, so the
+      // repository is the only copy.
+      const method = unpushed && unpushed > 0 ? `${unpushed} commit(s) here are on no remote; they survive removal in the repo. ${base}` : base;
       return { tier: "cheap", seconds: estimateWorktreeSeconds(candidate), method, needsNetwork: false, confidence: "estimated" };
     }
 

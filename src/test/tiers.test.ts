@@ -108,10 +108,15 @@ test("clean worktrees are cheap and offline", () => {
   assert.equal(cost.method, "git worktree add /repo/wt feature");
 });
 
-test("worktrees with unpushed commits stay cheap but flag it loudly in the method", () => {
+test("worktrees with unpushed commits are flagged, but not described as data loss", () => {
+  // git worktree remove deletes the working copy and git's bookkeeping, never
+  // the branch or its objects. Claiming the commits "will be lost" is false and
+  // would talk a user out of a safe action, so the wording must not say it.
   const cost = restoreCostFor(candidate("worktrees", { metadata: { worktreePath: "/repo/wt", branch: "feature", unpushedCommits: 3 } }));
   assert.equal(cost.tier, "cheap");
-  assert.match(cost.method, /3 unpushed commit/i);
+  assert.match(cost.method, /3 commit\(s\) here are on no remote/i);
+  assert.match(cost.method, /git worktree add \/repo\/wt feature/);
+  assert.ok(!/lost/i.test(cost.method), "must not claim commits are lost: they survive removal");
 });
 
 test("ai-history is irreplaceable", () => {
