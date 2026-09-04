@@ -8,6 +8,7 @@ import { type ExecuteContext, type Plan, type RunResult, type StorageProvider } 
 export interface ExecuteOptions {
   dryRun: boolean;
   strict: boolean;
+  forceUnlock?: boolean;
 }
 
 export async function executePlan(plan: Plan, providers: Map<string, StorageProvider>, context: ExecuteContext, options: ExecuteOptions): Promise<RunResult> {
@@ -18,15 +19,15 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
   if (plan.candidates.some((candidate) => candidate.providerStatus !== "verified" && candidate.eligible)) throw new Error("refusing to execute an eligible non-verified provider candidate");
   const execute = async (): Promise<RunResult> => {
     const startedAt = new Date().toISOString();
-    const result: RunResult = { schemaVersion: 1, startedAt, finishedAt: startedAt, planHash: plan.hash, dryRun: options.dryRun, results: [], deletedBytes: 0, wouldDeleteBytes: 0, skippedBytes: 0, failedBytes: 0 };
+    const result: RunResult = { schemaVersion: 2, startedAt, finishedAt: startedAt, planHash: plan.hash, dryRun: options.dryRun, results: [], deletedBytes: 0, wouldDeleteBytes: 0, declinedBytes: 0, skippedBytes: 0, failedBytes: 0 };
     const manifestPath = path.join(context.runDir, `run-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.json`);
     const persist = async (): Promise<void> => {
       if (!options.dryRun) await writeFile(manifestPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
     };
     for (const candidate of plan.candidates) {
       if (candidate.action === "skip" || !candidate.eligible || candidate.blockers.length > 0) {
-        result.results.push({ candidateId: candidate.id, status: "skipped", bytes: candidate.bytes, reason: candidate.blockers.join(", ") || "not eligible" });
-        result.skippedBytes += candidate.bytes;
+        result.results.push({ candidateId: candidate.id, status: "declined", bytes: candidate.bytes, reason: candidate.blockers.join(", ") || "not eligible" });
+        result.declinedBytes = (result.declinedBytes || 0) + candidate.bytes;
         await persist();
         continue;
       }
@@ -66,11 +67,11 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
       await persist();
     }
     result.finishedAt = new Date().toISOString();
+    if (options.strict && ((result.declinedBytes || 0) > 0 || result.skippedBytes > 0 || result.failedBytes > 0)) result.strictViolation = true;
     await persist();
-    if (options.strict && (result.skippedBytes > 0 || result.failedBytes > 0)) throw new Error(`strict cleanup failed: ${result.skippedBytes} bytes skipped, ${result.failedBytes} bytes failed`);
     return result;
   };
-  return options.dryRun ? execute() : withExecutionLock(context.runDir, execute);
+  return options.dryRun ? execute() : withExecutionLock(context.runDir, execute, { forceUnlock: options.forceUnlock });
 }
 
 export async function persistPlan(plan: Plan, target: string): Promise<void> {
