@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withExecutionLock } from "./locks.js";
 import { invalidateMeasureCache } from "./measure-cache.js";
+import { createRunId, decideQuarantine, freeBytesFor, nearestExistingAncestorDevice, purgeExpired, quarantineCandidate, quarantineRootDir, readQuarantineMetadata } from "./quarantine.js";
 import { hashValue, savePlan, verifyPlan } from "./plan.js";
 import { isWithinAny } from "./paths.js";
 import { type ExecuteContext, type Plan, type RunResult, type StorageProvider } from "./types.js";
@@ -9,6 +10,8 @@ import { type ExecuteContext, type Plan, type RunResult, type StorageProvider } 
 export interface ExecuteOptions {
   dryRun: boolean;
   strict: boolean;
+  /** Skip the holding area. Anything with no other way back is then refused, not deleted. */
+  noQuarantine?: boolean;
   forceUnlock?: boolean;
 }
 
@@ -25,6 +28,14 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
     const persist = async (): Promise<void> => {
       if (!options.dryRun) await writeFile(manifestPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
     };
+    const runId = result.runId ?? createRunId();
+    result.runId = runId;
+    // Purge before doing anything, so space freed by an earlier run is real
+    // before the user commits to this one.
+    if (!options.dryRun) await purgeExpired(context.runDir, context.now).catch(() => undefined);
+    const freeBytes = options.dryRun ? Number.MAX_SAFE_INTEGER : await freeBytesFor(context.runDir).catch(() => 0);
+    const quarantineRootDevice = options.dryRun ? undefined : await nearestExistingAncestorDevice(quarantineRootDir(context.runDir));
+
     for (const candidate of plan.candidates) {
       if (candidate.action === "skip" || !candidate.eligible || candidate.blockers.length > 0) {
         result.results.push({ candidateId: candidate.id, status: "declined", bytes: candidate.bytes, reason: candidate.blockers.join(", ") || "not eligible" });
@@ -52,6 +63,37 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
         continue;
       }
       try {
+        // Anything with no other way back is held rather than destroyed. Caches,
+        // build output and lockfile-backed installs go straight through: moving
+        // those would consume exactly the space being reclaimed, and rebuilding
+        // is their real undo.
+        const decision = decideQuarantine(candidate, {
+          freeBytes,
+          // An unknown device id must read as "a different disk", never as a
+          // match: we would rather refuse than attempt a cross-device move.
+          targetDevice: (candidate.target.kind === "path" ? await nearestExistingAncestorDevice(candidate.target.path) : undefined) ?? -1,
+          quarantineRootDevice: quarantineRootDevice ?? -2,
+          committedBytes: result.quarantinedBytes ?? 0,
+          noQuarantine: options.noQuarantine ?? false,
+        });
+        if (decision.mode === "refuse") {
+          result.results.push({ candidateId: candidate.id, status: "skipped", bytes: candidate.bytes, reason: decision.reason });
+          result.skippedBytes += candidate.bytes;
+          await persist();
+          continue;
+        }
+        if (decision.mode === "quarantine") {
+          const held = await quarantineCandidate(candidate, { stateDir: context.runDir, runId, now: context.now });
+          if (!held.ok) {
+            result.results.push({ candidateId: candidate.id, status: "failed", bytes: candidate.bytes, reason: held.reason || "could not hold this safely" });
+            result.failedBytes += candidate.bytes;
+          } else {
+            result.results.push({ candidateId: candidate.id, status: "quarantined", bytes: candidate.bytes, quarantinePath: held.entry?.quarantinePath });
+            result.quarantinedBytes = (result.quarantinedBytes ?? 0) + candidate.bytes;
+          }
+          await persist();
+          continue;
+        }
         const action = await provider.execute(candidate, context);
         if (!action.ok) {
           result.results.push({ candidateId: candidate.id, status: "failed", bytes: candidate.bytes, reason: action.reason || "provider action failed" });
@@ -66,6 +108,11 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
         result.failedBytes += candidate.bytes;
       }
       await persist();
+    }
+    // Tell the user when held items actually free their space, rather than
+    // letting "quarantined" read as "reclaimed".
+    if ((result.quarantinedBytes ?? 0) > 0) {
+      result.purgeAfter = (await readQuarantineMetadata(context.runDir, runId).catch(() => undefined))?.purgeAfter;
     }
     result.finishedAt = new Date().toISOString();
     if (options.strict && ((result.declinedBytes || 0) > 0 || result.skippedBytes > 0 || result.failedBytes > 0)) result.strictViolation = true;

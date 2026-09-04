@@ -39,6 +39,7 @@ function declinedCandidate(target: string): Candidate {
     eligible: false,
     blockers: ["younger-than-30-days"],
     autoSafe: false,
+    restoreCost: { tier: "cheap" as const, seconds: 5, method: "the provider re-creates this", needsNetwork: false, confidence: "estimated" as const },
   };
 }
 
@@ -58,6 +59,7 @@ function passingCandidate(target: string): Candidate {
     eligible: true,
     blockers: [],
     autoSafe: true,
+    restoreCost: { tier: "cheap" as const, seconds: 5, method: "the provider re-creates this", needsNetwork: false, confidence: "estimated" as const },
   };
 }
 
