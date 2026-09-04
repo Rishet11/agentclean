@@ -11,6 +11,19 @@ export interface TreeStats {
   /** True when a bound was hit: `bytes` is a lower bound, not a total. */
   partial: boolean;
   fingerprint: Fingerprint;
+  /**
+   * Immediate dirent count of the root directory at measurement time. The
+   * cache key already includes the root's mtimeMs, which changes whenever an
+   * entry is added/removed/renamed directly under the root — so on a real
+   * cache *hit* (key match), childCount should always still match today's
+   * readdir length. It exists purely as a cheap (single readdir) second
+   * signal against filesystems/mounts where mtime is not a reliable change
+   * indicator (network shares, some overlay/FUSE mounts, clock skew). It does
+   * NOT detect content changes nested deeper in the tree that never touch the
+   * root's own directory entries (e.g. a file rewritten in place two levels
+   * down) — see measureTree's cache-hit comment for that trade-off.
+   */
+  childCount?: number;
 }
 
 export interface MeasureCache {
@@ -28,6 +41,29 @@ export function createMeasureCache(): MeasureCache {
     get: (key) => store.get(key),
     set: (key, value) => void store.set(key, value),
   };
+}
+
+/**
+ * Cache shared across calls that do not pass their own `options.cache`.
+ * Providers this module does not own (git.ts, project.ts, providers/filesystem.ts)
+ * call `measureTree(target)` with no options at all, so this is the only way
+ * for them to benefit from a persisted cache without editing those files.
+ *
+ * Scope discipline matters here: `src/core/scan.ts` sets this only for the
+ * duration of `discover()` across all providers and clears it before
+ * returning. `revalidate()` (called later, right before a delete, from
+ * executor.ts) therefore always sees this as `undefined` and always does a
+ * fresh, uncached walk — the safety check that catches "changed since scan"
+ * must never be answered from a stale cache.
+ */
+let sharedMeasureCache: MeasureCache | undefined;
+
+export function setSharedMeasureCache(cache: MeasureCache | undefined): void {
+  sharedMeasureCache = cache;
+}
+
+export function getSharedMeasureCache(): MeasureCache | undefined {
+  return sharedMeasureCache;
 }
 
 const maxEntries = 250_000;
@@ -65,6 +101,8 @@ interface WalkAccum {
   symlinkCount: number;
   entries: number;
   partial: boolean;
+  /** Immediate dirent count of the root directory (depth 0), if its readdir succeeded. */
+  rootChildCount?: number;
 }
 
 /**
@@ -97,6 +135,7 @@ async function walk(root: string, limits: WalkLimits): Promise<WalkAccum> {
       acc.partial = true;
       return;
     }
+    if (depth === 0) acc.rootChildCount = dirents.length;
     const tasks: Promise<void>[] = [];
     for (const dirent of dirents) {
       if (acc.entries >= limits.maxEntries) {
@@ -143,6 +182,35 @@ export interface MeasureOptions {
   maxEntries?: number;
 }
 
+/**
+ * Single readdir of `resolvedTarget`'s immediate entries, compared against
+ * `cached.childCount`. See the `childCount` doc comment on TreeStats for what
+ * this does and does not protect against.
+ */
+async function cacheHitStillValid(resolvedTarget: string, cached: TreeStats): Promise<boolean> {
+  if (cached.childCount === undefined) return true;
+  const current = await readdir(resolvedTarget).catch(() => undefined);
+  return current !== undefined && current.length === cached.childCount;
+}
+
+/**
+ * Reads a directory's measurement out of `cache` (the shared cache when none
+ * is passed explicitly) without ever walking on a miss. Used by callers that
+ * want to know "is this a free cache hit right now" before deciding whether
+ * to pay for a walk at all (see CommandProvider.measureCacheDirectory).
+ * Returns undefined for anything that is not an existing, unchanged directory.
+ */
+export async function peekMeasureCache(target: string, cache: MeasureCache | undefined = sharedMeasureCache): Promise<TreeStats | undefined> {
+  if (!cache) return undefined;
+  const stats = await lstat(target).catch(() => undefined);
+  if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) return undefined;
+  const resolvedTarget = await safeRealPath(target);
+  if (!resolvedTarget) return undefined;
+  const cached = cache.get(measureCacheKey(stats));
+  if (!cached) return undefined;
+  return (await cacheHitStillValid(resolvedTarget, cached)) ? cached : undefined;
+}
+
 export async function measureTree(target: string, options: MeasureOptions = {}): Promise<TreeStats> {
   const stats = await lstat(target);
   if (stats.isSymbolicLink()) throw new Error("reparse-point");
@@ -151,9 +219,10 @@ export async function measureTree(target: string, options: MeasureOptions = {}):
   if (!stats.isDirectory()) {
     return { bytes: stats.size, fileCount: 1, symlinkCount: 0, partial: false, fingerprint: fingerprintFromStats(stats) };
   }
+  const activeCache = options.cache ?? sharedMeasureCache;
   const cacheKey = measureCacheKey(stats);
-  const cached = options.cache?.get(cacheKey);
-  if (cached) return cached;
+  const cached = activeCache?.get(cacheKey);
+  if (cached && (await cacheHitStillValid(resolvedTarget, cached))) return cached;
   const result = await walk(resolvedTarget, { maxEntries: options.maxEntries ?? measureEntryCap, maxDepth: Infinity, deadline: Infinity });
   const treeStats: TreeStats = {
     bytes: result.bytes,
@@ -161,26 +230,27 @@ export async function measureTree(target: string, options: MeasureOptions = {}):
     symlinkCount: result.symlinkCount,
     partial: result.partial,
     fingerprint: fingerprintFromStats(stats),
+    childCount: result.rootChildCount,
   };
-  options.cache?.set(cacheKey, treeStats);
+  activeCache?.set(cacheKey, treeStats);
   return treeStats;
 }
 
 export async function approximateTree(
   target: string,
   limits?: { maxEntries?: number; maxDepth?: number; budgetMs?: number },
-): Promise<{ bytes: number; fileCount: number; complete: boolean }> {
+): Promise<{ bytes: number; fileCount: number; symlinkCount: number; complete: boolean; childCount?: number }> {
   const stats = await lstat(target).catch(() => undefined);
-  if (!stats || stats.isSymbolicLink()) return { bytes: 0, fileCount: 0, complete: true };
-  if (!stats.isDirectory()) return { bytes: stats.size, fileCount: 1, complete: true };
+  if (!stats || stats.isSymbolicLink()) return { bytes: 0, fileCount: 0, symlinkCount: 0, complete: true };
+  if (!stats.isDirectory()) return { bytes: stats.size, fileCount: 1, symlinkCount: 0, complete: true };
   const resolved = await safeRealPath(target);
-  if (!resolved) return { bytes: 0, fileCount: 0, complete: true };
+  if (!resolved) return { bytes: 0, fileCount: 0, symlinkCount: 0, complete: true };
   const result = await walk(resolved, {
     maxEntries: limits?.maxEntries ?? 200_000,
     maxDepth: limits?.maxDepth ?? 6,
     deadline: Date.now() + (limits?.budgetMs ?? 1500),
   });
-  return { bytes: result.bytes, fileCount: result.fileCount, complete: !result.partial };
+  return { bytes: result.bytes, fileCount: result.fileCount, symlinkCount: result.symlinkCount, complete: !result.partial, childCount: result.rootChildCount };
 }
 
 export async function immediateChildren(target: string): Promise<string[]> {

@@ -3,7 +3,17 @@ import { mkdir, mkdtemp, realpath, stat, symlink, writeFile } from "node:fs/prom
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { approximateTree, measureCacheKey, measureTree, type MeasureCache, type TreeStats } from "../core/filesystem.js";
+import {
+  approximateTree,
+  createMeasureCache,
+  getSharedMeasureCache,
+  measureCacheKey,
+  measureTree,
+  peekMeasureCache,
+  setSharedMeasureCache,
+  type MeasureCache,
+  type TreeStats,
+} from "../core/filesystem.js";
 
 // os.tmpdir() is itself under a symlink on macOS (/var -> /private/var); measureTree
 // canonicalizes its root, so fixtures must already be canonical or path comparisons
@@ -106,4 +116,80 @@ test("the measure cache returns a cached result without re-walking", async () =>
   // Same key derives from (dev, ino, mtimeMs) of the root, independent of the walk.
   const rootStats = await stat(root);
   assert.equal(measureCacheKey(rootStats), measureCacheKey(rootStats));
+});
+
+test("a cache hit is re-validated with a single readdir and a top-level add invalidates it even if the stale entry lost its own childCount", async () => {
+  const root = await tempDir("agentclean-childcount-");
+  await writeFile(path.join(root, "a.txt"), "hello");
+
+  const store = new Map<string, TreeStats>();
+  const cache: MeasureCache = { get: (key) => store.get(key), set: (key, value) => store.set(key, value) };
+
+  const first = await measureTree(root, { cache });
+  assert.equal(first.childCount, 1);
+
+  // Forge a stale entry under the *same* key but without a childCount, simulating
+  // an older cache format: measureTree must trust it (nothing to check against).
+  const key = measureCacheKey(await stat(root));
+  store.set(key, { ...first, childCount: undefined });
+  const trusted = await measureTree(root, { cache });
+  assert.deepEqual(trusted, { ...first, childCount: undefined });
+
+  // Restore a real childCount, then forge a mismatch: measureTree must not
+  // trust it and should re-walk, discovering the file added below.
+  store.set(key, { ...first, childCount: 99 });
+  await writeFile(path.join(root, "b.txt"), "world");
+  const revalidated = await measureTree(root, { cache });
+  assert.equal(revalidated.fileCount, 2);
+  assert.equal(revalidated.childCount, 2);
+});
+
+test("measureTree falls back to the shared cache when no explicit cache is passed, and never touches it once cleared", async () => {
+  const root = await tempDir("agentclean-shared-cache-");
+  await writeFile(path.join(root, "a.txt"), "hello");
+
+  assert.equal(getSharedMeasureCache(), undefined);
+  const shared = createMeasureCache();
+  setSharedMeasureCache(shared);
+  try {
+    const first = await measureTree(root);
+    const second = await measureTree(root);
+    assert.deepEqual(second, first);
+    assert.equal(shared.get(measureCacheKey(await stat(root))) !== undefined, true);
+  } finally {
+    setSharedMeasureCache(undefined);
+  }
+
+  // Cleared: a fresh directory with the exact same size profile must not
+  // accidentally read back anything from the now-detached shared cache.
+  assert.equal(getSharedMeasureCache(), undefined);
+});
+
+test("peekMeasureCache never walks: it returns undefined on a miss instead of measuring", async () => {
+  const root = await tempDir("agentclean-peek-");
+  await writeFile(path.join(root, "a.txt"), "hello");
+  const cache = createMeasureCache();
+
+  assert.equal(await peekMeasureCache(root, cache), undefined);
+
+  const measured = await measureTree(root, { cache });
+  const peeked = await peekMeasureCache(root, cache);
+  assert.deepEqual(peeked, measured);
+
+  // A top-level change invalidates the peek the same way it invalidates measureTree.
+  await writeFile(path.join(root, "b.txt"), "world");
+  assert.equal(await peekMeasureCache(root, cache), undefined);
+});
+
+test("approximateTree reports symlinkCount and childCount alongside bytes", async () => {
+  const root = await tempDir("agentclean-approx-fields-");
+  await writeFile(path.join(root, "a.txt"), "x".repeat(10));
+  await mkdir(path.join(root, "sub"));
+  await symlink(path.join(root, "a.txt"), path.join(root, "link"));
+
+  const result = await approximateTree(root, { budgetMs: 5_000 });
+  assert.equal(result.complete, true);
+  assert.equal(result.symlinkCount, 1);
+  // root has: a.txt, sub, link
+  assert.equal(result.childCount, 3);
 });

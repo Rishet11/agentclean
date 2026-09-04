@@ -1,7 +1,9 @@
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 import type { Candidate, ExecuteContext, ProviderDetection, StorageProvider, Validation } from "../core/types.js";
+import { fingerprintFromStats } from "../core/types.js";
 import { runCommand } from "../core/command.js";
-import { measureTree } from "../core/filesystem.js";
+import { approximateTree, getSharedMeasureCache, measureCacheKey, measureTree, peekMeasureCache, type TreeStats } from "../core/filesystem.js";
 import { hashValue } from "../core/plan.js";
 import { safeRealPath, samePath } from "../core/paths.js";
 
@@ -49,6 +51,53 @@ export class CommandProvider implements StorageProvider {
     }
   }
 
+  /**
+   * Cleanup is delegated to the provider's own command (`uv cache prune`, and
+   * so on) so an exact byte count is not required to act on a candidate, only
+   * to rank and report it. A full `measureTree` of these directories is
+   * expensive purely for that: `~/.cache/uv` alone is ~122k files and costs
+   * 20-30s on a cold page cache. So:
+   *
+   *  1. Prefer an exact figure already sitting in the shared measurement
+   *     cache (near-free: one lstat + one map lookup + one readdir).
+   *  2. Otherwise, try a budgeted `approximateTree` (~1.5s). If it finishes
+   *     without hitting its bound, that number IS exact (same walk, just
+   *     bounded) — use and cache it, so the next run is a cache hit too.
+   *  3. Only if the budgeted walk is genuinely incomplete do we pay for a
+   *     real `measureTree`. An incomplete approximation is not close enough
+   *     to trust for ranking: measured on this machine, a 1.5s budget on
+   *     `~/.cache/uv` (true size ~10.06 GB) returned ~2.26 GB, over 4x low —
+   *     enough to misrank the single largest cache below git/npm in the
+   *     plain-text report, which has no way to mark a number as partial.
+   *     Reporting that silently would be a correctness regression, not a
+   *     speed win, so we refuse to ship it and pay the real cost instead.
+   *     This full walk still populates the cache, so only the first run
+   *     after a cold/invalidated cache entry pays it.
+   */
+  private async measureCacheDirectory(resolved: string): Promise<TreeStats | undefined> {
+    const stats = await lstat(resolved).catch(() => undefined);
+    if (!stats || stats.isSymbolicLink()) return undefined;
+    if (!stats.isDirectory()) return { bytes: stats.size, fileCount: 1, symlinkCount: 0, partial: false, fingerprint: fingerprintFromStats(stats) };
+    const cache = getSharedMeasureCache();
+    const key = measureCacheKey(stats);
+    const cached = await peekMeasureCache(resolved, cache);
+    if (cached) return cached;
+    const approximate = await approximateTree(resolved, { budgetMs: 1_500 }).catch(() => undefined);
+    if (approximate?.complete) {
+      const exact: TreeStats = {
+        bytes: approximate.bytes,
+        fileCount: approximate.fileCount,
+        symlinkCount: approximate.symlinkCount,
+        partial: false,
+        fingerprint: fingerprintFromStats(stats),
+        childCount: approximate.childCount,
+      };
+      cache?.set(key, exact);
+      return exact;
+    }
+    return await measureTree(resolved).catch(() => undefined);
+  }
+
   async discover(): Promise<Candidate[]> {
     let result;
     try {
@@ -60,7 +109,7 @@ export class CommandProvider implements StorageProvider {
     const targetPath = parseCachePath(result.stdout);
     if (!targetPath) return [];
     const resolved = path.resolve(targetPath);
-    const measured = await measureTree(resolved).catch(() => undefined);
+    const measured = await this.measureCacheDirectory(resolved);
     if (!measured) return [];
     return [{
       id: hashValue({ provider: this.id, path: resolved }).slice(0, 16),
