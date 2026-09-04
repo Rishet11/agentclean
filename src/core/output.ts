@@ -177,6 +177,13 @@ export function humanReason(reason: string): string {
     case "outside-allowed-root": return "outside your folders";
     case "locked": return "locked";
     case "missing-or-prunable": return "already gone";
+    case "project root is not currently allowed": return "project folders need --project-artifacts";
+    case "not eligible": return "not offered this run";
+    case "partial-measurement": return "too big to size exactly";
+    case "unmeasurable": return "could not be measured";
+    case "identity-changed":
+    case "changed-since-scan":
+    case "contents-changed-since-scan": return "changed while we looked";
     default: return reason.replace(/-/g, " ");
   }
 }

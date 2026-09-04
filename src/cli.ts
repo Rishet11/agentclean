@@ -5,12 +5,15 @@ import { stdin, stdout, stderr } from "node:process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { loadConfig, saveConfig } from "./config/store.js";
 import { makeContext, makeContextWithDiscoveredRoots } from "./core/context.js";
 import { EXIT_FATAL, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE } from "./core/errors.js";
 import { executePlan } from "./core/executor.js";
 import { autoPlan } from "./core/auto.js";
 import { createPlan, loadPlan, savePlan } from "./core/plan.js";
+import { purgeExpired, purgeRun, quarantineRootDir, restoreRun } from "./core/quarantine.js";
+import { displayPath, stateDir } from "./core/paths.js";
 import { buildReport } from "./core/report.js";
 import { runChecklist } from "./ui/checklist.js";
 import { formatBytes, humanFailure, shortLabelForCandidate } from "./core/output.js";
@@ -82,6 +85,7 @@ The short version:
   agentclean                    look around, see what could be freed
   agentclean clean               choose what to remove, one item at a time
   agentclean clean --dry-run     preview a real run without changing anything
+  agentclean restore             put back anything still being held
   agentclean scan -v             full detail on everything found
 
 Options you'll actually use:
@@ -98,6 +102,7 @@ Less common:
   agentclean explain <candidate-id>    why one item was flagged (needs --plan)
   agentclean doctor                    diagnostics for a bug report
   agentclean config root add <path>    remember a folder for every future scan
+  agentclean purge                     free held space now instead of waiting
   agentclean auto install --interval <weekly|...>   set up scheduled cleanup
   agentclean auto uninstall | status   manage scheduled cleanup
   --out <file>            save a scan to a plan file
@@ -249,6 +254,47 @@ export function cleanExitCode(result: RunResult): number {
   return result.failedBytes > 0 || result.skippedBytes > 0 || result.strictViolation ? EXIT_PARTIAL : EXIT_OK;
 }
 
+/**
+ * Undo. Only ever holds what had no other way back, so this is short by design:
+ * caches and build output were never moved here in the first place.
+ */
+async function runRestore(positionals: string[], options: Options): Promise<number> {
+  const target = positionals[1] || "last";
+  const held = await readdir(quarantineRootDir(stateDir(process.env))).catch(() => [] as string[]);
+  if (held.length === 0) {
+    stdout.write("\n  Nothing is being held.\n  Only things with no other way back are kept, and none are right now.\n\n");
+    return EXIT_OK;
+  }
+  const outcome = await restoreRun(stateDir(process.env), target === "last" ? "last" : target);
+  if (options.json) { await writeOutput(outcome, options); return EXIT_OK; }
+  stdout.write("\n");
+  if (outcome.restored.length > 0) {
+    stdout.write(`  Put back ${outcome.restored.length} item(s)\n`);
+    for (const entry of outcome.restored.slice(0, 8)) stdout.write(`    ${displayPath(entry.originalPath)}\n`);
+  }
+  if (outcome.conflicts.length > 0) {
+    stdout.write(`\n  ${outcome.conflicts.length} left where they are, because something already exists at the original path:\n`);
+    for (const entry of outcome.conflicts.slice(0, 5)) stdout.write(`    ${displayPath(entry.originalPath)}\n`);
+  }
+  if (outcome.missing.length > 0) stdout.write(`\n  ${outcome.missing.length} item(s) were already gone from the holding area.\n`);
+  if (outcome.restored.length === 0 && outcome.conflicts.length === 0) stdout.write("  Nothing to put back.\n");
+  stdout.write("\n");
+  return EXIT_OK;
+}
+
+/** Make held space real, either on schedule or because the user wants it now. */
+async function runPurge(positionals: string[], options: Options): Promise<number> {
+  const root = stateDir(process.env);
+  const outcome = positionals[1] && positionals[1] !== "--all"
+    ? await purgeRun(root, positionals[1])
+    : await purgeExpired(root, Date.now());
+  if (options.json) { await writeOutput(outcome, options); return EXIT_OK; }
+  stdout.write(outcome.removedBytes > 0
+    ? `\n  Freed ${formatBytes(outcome.removedBytes)} that was being held.\n  It is gone for good now.\n\n`
+    : "\n  Nothing was ready to purge.\n  Held items are kept for 7 days before their space is actually freed.\n\n");
+  return EXIT_OK;
+}
+
 async function runProviders(options: Options): Promise<number> {
   const config = await loadConfig();
   const context = makeContext(config);
@@ -325,6 +371,8 @@ async function main(): Promise<number> {
   if (command === "providers") return await runProviders(options);
   if (command === "explain") return await runExplain(positionals[1] || "", options);
   if (command === "doctor") return await runDoctor(options);
+  if (command === "restore") return await runRestore(positionals, options);
+  if (command === "purge") return await runPurge(positionals, options);
   if (command === "config") return await runConfig(positionals, options);
   throw new UsageError(`unknown command: ${command}`, true);
 }
