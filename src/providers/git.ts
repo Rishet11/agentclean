@@ -4,6 +4,7 @@ import type { Candidate, ExecuteContext, StorageProvider, Validation } from "../
 import { runCommand } from "../core/command.js";
 import { measureTree } from "../core/filesystem.js";
 import { hashValue } from "../core/plan.js";
+import { normalizeVersion } from "./command.js";
 import { isWithin, isWithinAny, safeRealPath, samePath } from "../core/paths.js";
 
 interface WorktreeRecord { path: string; branch?: string; locked: boolean; prunable: boolean; }
@@ -46,18 +47,23 @@ export class GitWorktreeProvider implements StorageProvider {
 
   async detect(): Promise<import("../core/types.js").ProviderDetection> {
     const result = await runCommand(["git", "--version"], undefined, 5_000).catch(() => undefined);
-    return { id: this.id, name: this.name, status: result?.code === 0 ? this.status : "unavailable", details: result?.code === 0 ? "Git worktree metadata available" : "Git unavailable", capabilities: ["clean-linked-worktrees", "porcelain-status"] };
+    const version = result?.code === 0 ? normalizeVersion(result.stdout) : undefined;
+    return { id: this.id, name: this.name, status: result?.code === 0 ? this.status : "unavailable", details: result?.code === 0 ? "Git worktree metadata available" : "Git unavailable", version, capabilities: ["clean-linked-worktrees", "porcelain-status"] };
   }
 
   async discover(context: ExecuteContext): Promise<Candidate[]> {
     const repositories = await findRepositories(context.roots);
     const output: Candidate[] = [];
+    const seen = new Set<string>();
     for (const repo of repositories) {
       let entries;
       try { entries = await worktrees(repo); } catch { continue; }
       const main = entries[0]?.path;
       for (const entry of entries.slice(1)) {
         const target = path.resolve(entry.path);
+        const key = process.platform === "win32" ? target.toLowerCase() : target;
+        if (seen.has(key)) continue;
+        seen.add(key);
         const blockers: string[] = [];
         if (entry.locked) blockers.push("locked");
         if (entry.prunable) blockers.push("missing-or-prunable");
@@ -72,7 +78,18 @@ export class GitWorktreeProvider implements StorageProvider {
         const worktreeStatus = exists ? await status(target) : "";
         if (worktreeStatus.trim()) blockers.push("dirty-or-untracked");
         const submodules = exists ? await runCommand(["git", "submodule", "status"], target, 20_000).catch(() => undefined) : undefined;
-        if (submodules?.code === 0 && submodules.stdout.trim()) blockers.push("contains-submodules");
+        // git submodule status markers: " " clean, "+" checked-out commit differs
+        // from the index, "U" merge conflict, "-" not initialized. Only + and U
+        // mean there is state in the worktree to lose. "-" means the submodule
+        // was never checked out, so the directory is empty and blocking on it
+        // refused 30 of 40 real worktrees while protecting nothing.
+        const submoduleLines = submodules?.code === 0 ? submodules.stdout.split(/\r?\n/).filter((line) => line.length > 0) : [];
+        const dirtySubmodules = submoduleLines.filter((line) => line.startsWith("+") || line.startsWith("U")).length;
+        const uninitializedSubmodules = submoduleLines.filter((line) => line.startsWith("-")).length;
+        if (dirtySubmodules > 0) blockers.push("dirty-submodules");
+        const ahead = exists ? await runCommand(["git", "rev-list", "--count", "@{upstream}..HEAD"], target, 20_000).catch(() => undefined) : undefined;
+        const hasUpstream = ahead?.code === 0;
+        const unpushedCommits = hasUpstream ? Number.parseInt(ahead.stdout.trim(), 10) || 0 : undefined;
         const stats = exists ? await lstat(target).catch(() => undefined) : undefined;
         const bytes = measured?.bytes ?? 0;
         output.push({
@@ -92,7 +109,15 @@ export class GitWorktreeProvider implements StorageProvider {
           blockers,
           autoSafe: false,
           partialMeasurement: measured?.partial,
-          metadata: { repo, branch: entry.branch || "detached", worktreePath: target },
+          metadata: {
+            repo,
+            branch: entry.branch || "detached",
+            worktreePath: target,
+            hasUpstream,
+            ...(unpushedCommits === undefined ? {} : { unpushedCommits }),
+            dirtySubmodules,
+            uninitializedSubmodules,
+          },
         });
       }
     }
