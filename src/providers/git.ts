@@ -9,7 +9,30 @@ import { isWithin, isWithinAny, safeRealPath, samePath } from "../core/paths.js"
 
 interface WorktreeRecord { path: string; branch?: string; locked: boolean; prunable: boolean; }
 
-function parseWorktrees(output: string): WorktreeRecord[] {
+/**
+ * Small bounded-concurrency gate; caps parallel subprocess spawns. No dependency
+ * needed (same pattern as the one in core/filesystem.ts for directory walks).
+ */
+function createLimiter(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const release = () => {
+    active -= 1;
+    const next = queue.shift();
+    if (next) next();
+  };
+  return async function run<T>(fn: () => Promise<T>): Promise<T> {
+    if (active >= max) await new Promise<void>((resolve) => queue.push(resolve));
+    active += 1;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
+
+export function parseWorktrees(output: string): WorktreeRecord[] {
   const entries: WorktreeRecord[] = [];
   let current: WorktreeRecord | undefined;
   for (const token of output.split("\0")) {
@@ -53,75 +76,98 @@ export class GitWorktreeProvider implements StorageProvider {
 
   async discover(context: ExecuteContext): Promise<Candidate[]> {
     const repositories = await findRepositories(context.roots);
-    const output: Candidate[] = [];
+    const limit = createLimiter(12);
+    // `git worktree list` runs once per discovered repo root, and a linked
+    // worktree's own `.git` file makes findRepositories treat it as a repo
+    // root too, so this is often more than one spawn per real repository.
+    // Independent of every other repo's listing, so it goes through the same
+    // bounded gate as the per-worktree checks below rather than one at a time.
+    const listings = await Promise.all(
+      repositories.map((repo) => limit(async () => ({ repo, entries: await worktrees(repo).catch(() => undefined) }))),
+    );
     const seen = new Set<string>();
-    for (const repo of repositories) {
-      let entries;
-      try { entries = await worktrees(repo); } catch { continue; }
+    const tasks: Array<() => Promise<Candidate>> = [];
+    for (const { repo, entries } of listings) {
+      if (!entries) continue;
       const main = entries[0]?.path;
       for (const entry of entries.slice(1)) {
         const target = path.resolve(entry.path);
         const key = process.platform === "win32" ? target.toLowerCase() : target;
         if (seen.has(key)) continue;
         seen.add(key);
-        const blockers: string[] = [];
-        if (entry.locked) blockers.push("locked");
-        if (entry.prunable) blockers.push("missing-or-prunable");
-        if (main && samePath(main, target)) blockers.push("main-worktree");
-        if (isWithin(target, context.cwd)) blockers.push("current-directory");
-        if (!isWithinAny(context.roots, target)) blockers.push("outside-allowed-root");
-        const exists = await safeRealPath(target);
-        if (!exists) blockers.push("path-missing");
-        let measured;
-        if (exists) measured = await measureTree(target).catch(() => undefined);
-        if (exists && !measured) blockers.push("unmeasurable");
-        const worktreeStatus = exists ? await status(target) : "";
-        if (worktreeStatus.trim()) blockers.push("dirty-or-untracked");
-        const submodules = exists ? await runCommand(["git", "submodule", "status"], target, 20_000).catch(() => undefined) : undefined;
-        // git submodule status markers: " " clean, "+" checked-out commit differs
-        // from the index, "U" merge conflict, "-" not initialized. Only + and U
-        // mean there is state in the worktree to lose. "-" means the submodule
-        // was never checked out, so the directory is empty and blocking on it
-        // refused 30 of 40 real worktrees while protecting nothing.
-        const submoduleLines = submodules?.code === 0 ? submodules.stdout.split(/\r?\n/).filter((line) => line.length > 0) : [];
-        const dirtySubmodules = submoduleLines.filter((line) => line.startsWith("+") || line.startsWith("U")).length;
-        const uninitializedSubmodules = submoduleLines.filter((line) => line.startsWith("-")).length;
-        if (dirtySubmodules > 0) blockers.push("dirty-submodules");
-        const ahead = exists ? await runCommand(["git", "rev-list", "--count", "@{upstream}..HEAD"], target, 20_000).catch(() => undefined) : undefined;
-        const hasUpstream = ahead?.code === 0;
-        const unpushedCommits = hasUpstream ? Number.parseInt(ahead.stdout.trim(), 10) || 0 : undefined;
-        const stats = exists ? await lstat(target).catch(() => undefined) : undefined;
-        const bytes = measured?.bytes ?? 0;
-        output.push({
-          id: hashValue({ provider: this.id, repo, target }).slice(0, 16),
-          provider: this.id,
-          providerStatus: this.status,
-          category: "worktrees",
-          action: "provider-command",
-          target: { kind: "command", command: ["git", "worktree", "remove", target], cwd: repo },
-          reason: `Linked worktree for ${path.basename(repo)}`,
-          evidence: ["git worktree list --porcelain identified this linked worktree", "git status checked before planning"],
-          bytes,
-          fileCount: measured?.fileCount ?? 0,
-          mtimeMs: stats?.mtimeMs ?? 0,
-          fingerprint: stats ? { kind: stats.isDirectory() ? "directory" : "file", size: stats.size, mtimeMs: stats.mtimeMs, dev: stats.dev, ino: stats.ino } : undefined,
-          eligible: blockers.length === 0,
-          blockers,
-          autoSafe: false,
-          partialMeasurement: measured?.partial,
-          metadata: {
-            repo,
-            branch: entry.branch || "detached",
-            worktreePath: target,
-            hasUpstream,
-            ...(unpushedCommits === undefined ? {} : { unpushedCommits }),
-            dirtySubmodules,
-            uninitializedSubmodules,
-          },
-        });
+        tasks.push(() => this.buildCandidate(repo, entry, target, main, context));
       }
     }
-    return output;
+    // Every worktree's checks are independent of every other's; the heavy
+    // part -- three subprocess spawns plus a tree measurement per worktree --
+    // runs with bounded concurrency so ~40 worktrees don't mean ~120
+    // sequential spawns. Every blocker below is still computed for every
+    // worktree; nothing here changes what gets checked, only when.
+    return await Promise.all(tasks.map((task) => limit(task)));
+  }
+
+  private async buildCandidate(
+    repo: string,
+    entry: WorktreeRecord,
+    target: string,
+    main: string | undefined,
+    context: ExecuteContext,
+  ): Promise<Candidate> {
+    const blockers: string[] = [];
+    if (entry.locked) blockers.push("locked");
+    if (entry.prunable) blockers.push("missing-or-prunable");
+    if (main && samePath(main, target)) blockers.push("main-worktree");
+    if (isWithin(target, context.cwd)) blockers.push("current-directory");
+    if (!isWithinAny(context.roots, target)) blockers.push("outside-allowed-root");
+    const exists = await safeRealPath(target);
+    if (!exists) blockers.push("path-missing");
+    let measured;
+    if (exists) measured = await measureTree(target).catch(() => undefined);
+    if (exists && !measured) blockers.push("unmeasurable");
+    const worktreeStatus = exists ? await status(target) : "";
+    if (worktreeStatus.trim()) blockers.push("dirty-or-untracked");
+    const submodules = exists ? await runCommand(["git", "submodule", "status"], target, 20_000).catch(() => undefined) : undefined;
+    // git submodule status markers: " " clean, "+" checked-out commit differs
+    // from the index, "U" merge conflict, "-" not initialized. Only + and U
+    // mean there is state in the worktree to lose. "-" means the submodule
+    // was never checked out, so the directory is empty and blocking on it
+    // refused 30 of 40 real worktrees while protecting nothing.
+    const submoduleLines = submodules?.code === 0 ? submodules.stdout.split(/\r?\n/).filter((line) => line.length > 0) : [];
+    const dirtySubmodules = submoduleLines.filter((line) => line.startsWith("+") || line.startsWith("U")).length;
+    const uninitializedSubmodules = submoduleLines.filter((line) => line.startsWith("-")).length;
+    if (dirtySubmodules > 0) blockers.push("dirty-submodules");
+    const ahead = exists ? await runCommand(["git", "rev-list", "--count", "@{upstream}..HEAD"], target, 20_000).catch(() => undefined) : undefined;
+    const hasUpstream = ahead?.code === 0;
+    const unpushedCommits = hasUpstream ? Number.parseInt(ahead.stdout.trim(), 10) || 0 : undefined;
+    const stats = exists ? await lstat(target).catch(() => undefined) : undefined;
+    const bytes = measured?.bytes ?? 0;
+    return {
+      id: hashValue({ provider: this.id, repo, target }).slice(0, 16),
+      provider: this.id,
+      providerStatus: this.status,
+      category: "worktrees",
+      action: "provider-command",
+      target: { kind: "command", command: ["git", "worktree", "remove", target], cwd: repo },
+      reason: `Linked worktree for ${path.basename(repo)}`,
+      evidence: ["git worktree list --porcelain identified this linked worktree", "git status checked before planning"],
+      bytes,
+      fileCount: measured?.fileCount ?? 0,
+      mtimeMs: stats?.mtimeMs ?? 0,
+      fingerprint: stats ? { kind: stats.isDirectory() ? "directory" : "file", size: stats.size, mtimeMs: stats.mtimeMs, dev: stats.dev, ino: stats.ino } : undefined,
+      eligible: blockers.length === 0,
+      blockers,
+      autoSafe: false,
+      partialMeasurement: measured?.partial,
+      metadata: {
+        repo,
+        branch: entry.branch || "detached",
+        worktreePath: target,
+        hasUpstream,
+        ...(unpushedCommits === undefined ? {} : { unpushedCommits }),
+        dirtySubmodules,
+        uninitializedSubmodules,
+      },
+    };
   }
 
   explain(candidate: Candidate): string { return `${candidate.reason}. Git metadata and porcelain status are checked again before removal; dirty, locked, missing, current, and submodule worktrees are skipped.`; }
