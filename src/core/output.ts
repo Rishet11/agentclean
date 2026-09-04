@@ -47,6 +47,68 @@ function rowLine(row: ReportRow, colorOn: boolean): string {
  * `--json` output is wired separately (at merge time) to the same
  * `buildReport` call, so the two views are always in sync.
  */
+/** Friendly one- or two-word name for a row, instead of a full command or path. */
+function shortLabel(row: { provider: string; category: string; label: string; path?: string }): string {
+  const caches: Record<string, string> = { uv: "uv cache", npm: "npm cache", pnpm: "pnpm store", go: "go modules", pip: "pip cache", yarn: "yarn cache", bun: "bun cache" };
+  if (caches[row.provider]) return caches[row.provider];
+  if (row.provider === "git") return `worktree ${basenameOf(row.label)}`;
+  if (row.category === "build-artifacts") return "build output";
+  if (row.category === "project-dependencies") return "node_modules";
+  if (row.category === "project-environments") return "virtualenv";
+  if (row.category === "ai-history") return "chat history";
+  if (row.category === "ai-caches") return `${row.provider} cache`;
+  return basenameOf(row.label);
+}
+
+function basenameOf(value: string): string {
+  const cleaned = value.replace(/\s+refs\/heads\/.*$/, "").trim();
+  const parts = cleaned.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || cleaned;
+}
+
+/**
+ * The default view. A person with a full disk wants one screen: how much is
+ * there, what the biggest wins are, what it costs to get each back, and what
+ * was deliberately left alone. Everything else lives behind -v or --json.
+ */
+export function printSummary(plan: Plan, output: NodeJS.WritableStream): void {
+  const colorOn = colorEnabled(output as { isTTY?: boolean });
+  const model = buildReport(plan);
+  const leftAlone = model.totalBytes - model.eligibleBytes;
+
+  output.write("\n");
+  output.write(`  ${bold(`${formatBytes(model.totalBytes)} found`, colorOn)}  ${dim("\u00b7", colorOn)}  ${bold(`${formatBytes(model.eligibleBytes)} safe to clear now`, colorOn)}\n\n`);
+
+  const eligible = model.rows.filter((row) => row.eligible).slice(0, 5);
+  for (const row of eligible) {
+    output.write(`    ${padRight(formatBytes(row.bytes), 8)} ${padRight(shortLabel(row), 17)} ${dim(row.restoreMethod || "", colorOn)}\n`);
+  }
+  const restCount = model.rows.filter((row) => row.eligible).length - eligible.length;
+  const restBytes = model.eligibleBytes - eligible.reduce((sum, row) => sum + row.bytes, 0);
+  if (restCount > 0) output.write(`    ${dim(`+ ${restCount} smaller item(s), ${formatBytes(restBytes)}`, colorOn)}\n`);
+
+  if (leftAlone > 0) {
+    const reasons = model.blocked.slice(0, 3).map((entry) => humanReason(entry.reason)).join(", ");
+    output.write(`\n  ${formatBytes(leftAlone)} left alone  ${dim("\u00b7", colorOn)}  ${dim(reasons || "protected", colorOn)}\n`);
+  }
+
+  output.write(`\n  ${bold("agentclean clean", colorOn)}      choose what to remove\n`);
+  output.write(`  ${bold("agentclean scan -v", colorOn)}    full detail\n\n`);
+}
+
+/** Blocker ids are precise; this is what a person would say instead. */
+function humanReason(reason: string): string {
+  if (reason.startsWith("younger-than")) return "recently used";
+  switch (reason) {
+    case "history-requires-explicit-opt-in": return "chat history";
+    case "dirty-or-untracked": return "unsaved work";
+    case "outside-allowed-root": return "outside your folders";
+    case "locked": return "locked";
+    case "missing-or-prunable": return "already gone";
+    default: return reason.replace(/-/g, " ");
+  }
+}
+
 export function printPlan(plan: Plan, output: NodeJS.WritableStream): void {
   const colorOn = colorEnabled(output as { isTTY?: boolean });
   const model = buildReport(plan);

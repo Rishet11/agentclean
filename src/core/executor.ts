@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withExecutionLock } from "./locks.js";
+import { invalidateMeasureCache } from "./measure-cache.js";
 import { hashValue, savePlan, verifyPlan } from "./plan.js";
 import { isWithinAny } from "./paths.js";
 import { type ExecuteContext, type Plan, type RunResult, type StorageProvider } from "./types.js";
@@ -69,6 +70,13 @@ export async function executePlan(plan: Plan, providers: Map<string, StorageProv
     result.finishedAt = new Date().toISOString();
     if (options.strict && ((result.declinedBytes || 0) > 0 || result.skippedBytes > 0 || result.failedBytes > 0)) result.strictViolation = true;
     await persist();
+    // A prune can empty a cache without touching the root directory's mtime, so
+    // a cached measurement would keep advertising space that is already gone.
+    // Measured: after uv cache prune took ~/.cache/uv from 10.06 GB to 1.9 GB,
+    // the next scan still offered 10.06 GB from cache.
+    if (!options.dryRun && (result.deletedBytes > 0 || (result.quarantinedBytes ?? 0) > 0)) {
+      await invalidateMeasureCache(context.runDir);
+    }
     return result;
   };
   return options.dryRun ? execute() : withExecutionLock(context.runDir, execute, { forceUnlock: options.forceUnlock });

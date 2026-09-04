@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadMeasureCache, measureCacheFilePath } from "../core/measure-cache.js";
+import { invalidateMeasureCache, loadMeasureCache, measureCacheFilePath } from "../core/measure-cache.js";
 import { measureCacheKey, type TreeStats } from "../core/filesystem.js";
 
 async function tempRunDir(): Promise<string> {
@@ -144,4 +145,27 @@ test("wires into measureTree's shared cache the same way scan.ts does: warm on a
   const second = await loadMeasureCache(runDir);
   const rootStats = await stat(root);
   assert.deepEqual(second.cache.get(measureCacheKey(rootStats)), measured);
+});
+
+test("a run that freed space discards the cache, so the next scan cannot advertise it", async () => {
+  // Regression from a real run: `uv cache prune` took ~/.cache/uv from 10.06 GB
+  // to 1.9 GB and `pnpm store prune` emptied the pnpm store, but neither
+  // changed its root directory's mtime, so the next scan served both from
+  // cache and offered 11 GB that no longer existed.
+  const runDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-invalidate-")));
+  try {
+    const cache = await loadMeasureCache(runDir);
+    cache.cache.set("dev:ino:mtime", { bytes: 10_060_000_000, fileCount: 122_313, symlinkCount: 0, partial: false, fingerprint: { kind: "directory", size: 0, mtimeMs: 1 } });
+    await cache.save();
+    assert.ok(existsSync(measureCacheFilePath(runDir)), "cache file should exist before invalidation");
+
+    await invalidateMeasureCache(runDir);
+    assert.equal(existsSync(measureCacheFilePath(runDir)), false, "a freeing run must discard the cache");
+
+    const reloaded = await loadMeasureCache(runDir);
+    assert.equal(reloaded.cache.get("dev:ino:mtime"), undefined, "stale size must not survive");
+    await invalidateMeasureCache(runDir); // idempotent, must not throw
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+  }
 });

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Fingerprint } from "./types.js";
 import type { MeasureCache, TreeStats } from "./filesystem.js";
@@ -145,4 +145,22 @@ async function saveMeasureCache(runDir: string, entries: Map<string, PersistedEn
   } catch {
     // A cache write failure must never fail a scan.
   }
+}
+
+/**
+ * Drop the persisted cache entirely.
+ *
+ * The cache keys on the root's (dev, ino, mtimeMs). A directory's mtime only
+ * moves when its own immediate entries change, so a prune that deletes files
+ * deep inside leaves the root looking untouched. Measured after a real run:
+ * `uv cache prune` took ~/.cache/uv from 10.06 GB to 1.9 GB and `pnpm store
+ * prune` took the pnpm store to zero, while the next scan still advertised
+ * 10.06 GB and 1.12 GB from cache.
+ *
+ * Advertising space that is already gone is the one number this tool cannot
+ * get wrong, so any run that actually changed something discards the cache and
+ * pays for one honest re-measure next time.
+ */
+export async function invalidateMeasureCache(runDir: string): Promise<void> {
+  await rm(measureCacheFilePath(runDir), { force: true }).catch(() => undefined);
 }

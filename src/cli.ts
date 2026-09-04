@@ -11,7 +11,7 @@ import { EXIT_FATAL, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE } from "./core/errors.js"
 import { executePlan } from "./core/executor.js";
 import { autoPlan } from "./core/auto.js";
 import { loadPlan, savePlan } from "./core/plan.js";
-import { printPlan, printProviders, printResult } from "./core/output.js";
+import { printPlan, printProviders, printResult, printSummary } from "./core/output.js";
 import { scanProviders } from "./core/scan.js";
 import { providerMap, providers } from "./providers/registry.js";
 import { installScheduler, schedulerStatus, uninstallScheduler } from "./platform/scheduler.js";
@@ -30,6 +30,7 @@ interface Options {
   dryRun: boolean;
   yes: boolean;
   strict: boolean;
+  verbose: boolean;
   out?: string;
   plan?: string;
   category?: string;
@@ -42,7 +43,7 @@ interface Options {
 
 function parseOptions(args: string[]): { positionals: string[]; options: Options } {
   const positionals: string[] = [];
-  const options: Options = { json: false, dryRun: false, yes: false, strict: false, roots: [], projectArtifacts: false, forceUnlock: false };
+  const options: Options = { json: false, dryRun: false, yes: false, strict: false, verbose: false, roots: [], projectArtifacts: false, forceUnlock: false };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--json") options.json = true;
@@ -50,6 +51,7 @@ function parseOptions(args: string[]): { positionals: string[]; options: Options
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--yes" || arg === "-y") options.yes = true;
     else if (arg === "--strict") options.strict = true;
+    else if (arg === "--verbose" || arg === "-v") options.verbose = true;
     else if (arg === "--force-unlock") options.forceUnlock = true;
     else if (arg === "--out" || arg === "--plan" || arg === "--category" || arg === "--provider" || arg === "--root" || arg === "--interval") {
       const value = args[++index];
@@ -117,7 +119,8 @@ async function runScan(options: Options, autoOnly = false): Promise<number> {
   const filtered = autoOnly ? autoPlan(plan, config.policy, context.now) : plan;
   if (options.out) await savePlan(filtered, path.resolve(options.out));
   if (options.json) await writeOutput(filtered, options);
-  else printPlan(filtered, stdout);
+  else if (options.verbose) printPlan(filtered, stdout);
+  else printSummary(filtered, stdout);
   return EXIT_OK;
 }
 
@@ -128,7 +131,7 @@ async function runClean(options: Options, autoOnly = false): Promise<number> {
   if (autoOnly && options.plan) throw new UsageError("auto mode always scans a fresh plan; --plan is not allowed");
   const plan = options.plan ? await loadPlan(path.resolve(options.plan)) : await scanProviders([...map.values()], context, { category: options.category, provider: options.provider });
   const selected = autoOnly ? autoPlan(plan, config.policy, context.now) : plan;
-  if (!options.json) printPlan(selected, stdout);
+  if (!options.json) (options.verbose ? printPlan : printSummary)(selected, stdout);
   const eligible = selected.candidates.filter((candidate) => candidate.eligible && candidate.blockers.length === 0 && candidate.action !== "skip");
   if (options.dryRun) {
     const result = await executePlan(selected, map, { ...context, dryRun: true }, { dryRun: true, strict: options.strict });
