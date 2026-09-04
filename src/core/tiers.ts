@@ -87,14 +87,31 @@ function needsNetworkGuess(candidate: Candidate): boolean {
   return /download|fetch|remote|registry|network|sync/.test(haystack);
 }
 
+/** How a package cache comes back: on its own, next time that tool fetches. */
+function cacheRefillMethod(provider: string): string {
+  switch (provider) {
+    case "npm": return "refills on the next npm install";
+    case "pnpm": return "refills on the next pnpm install";
+    case "yarn": return "refills on the next yarn install";
+    case "bun": return "refills on the next bun install";
+    case "uv": return "refills on the next uv install";
+    case "pip": return "refills on the next pip install";
+    case "go": return "refills on the next go build";
+    default: return "refills on the next install";
+  }
+}
+
 export function restoreCostFor(candidate: Candidate): RestoreCost {
   switch (candidate.category) {
     case "build-artifacts":
       return { tier: "free", seconds: estimateBuildSeconds(candidate), method: buildRestoreMethod(candidate), needsNetwork: false, confidence: "estimated" };
 
     case "package-caches": {
-      const method = candidate.target.kind === "command" ? candidate.target.command.join(" ") : "the provider's prune command";
-      return { tier: "cheap", seconds: estimateCacheSeconds(candidate), method, needsNetwork: true, confidence: "estimated" };
+      // The restore path is not a command the user runs, and it is emphatically
+      // not the cleanup command: a package cache repopulates by itself the next
+      // time the tool it belongs to fetches something. Naming target.command
+      // here told the user to "restore" with the command that did the removal.
+      return { tier: "cheap", seconds: estimateCacheSeconds(candidate), method: cacheRefillMethod(candidate.provider), needsNetwork: true, confidence: "estimated" };
     }
 
     case "project-dependencies": {

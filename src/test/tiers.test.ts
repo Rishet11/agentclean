@@ -32,34 +32,40 @@ test("build-artifacts are free, offline, and name the build command", () => {
   }
 });
 
-test("package caches are cheap and take their method from the provider's own cleanup command", () => {
+test("a package cache's restore method is how it refills, never the command that cleared it", () => {
+  // Regression: method was taken from target.command, so the report told the
+  // user to restore 10 GB of uv cache by running `uv cache prune` — the very
+  // command that had just removed it. A package cache is not restored by a
+  // command; it repopulates when the tool next fetches something.
   const uv = restoreCostFor(candidate("package-caches", { provider: "uv", target: { kind: "command", command: ["uv", "cache", "prune"] } }));
   assert.equal(uv.tier, "cheap");
-  assert.equal(uv.method, "uv cache prune");
   assert.equal(uv.needsNetwork, true);
+  assert.match(uv.method, /refills on the next uv/);
+  assert.ok(!uv.method.includes("prune"), "restore method must not echo the cleanup command");
 
   const go = restoreCostFor(candidate("package-caches", { provider: "go", target: { kind: "command", command: ["go", "clean", "-modcache"] } }));
-  assert.equal(go.method, "go clean -modcache");
+  assert.match(go.method, /refills on the next go/);
+  assert.ok(!go.method.includes("clean"), "restore method must not echo the cleanup command");
 });
 
-test("new package-cache providers (yarn, bun, pip) are cheap with a non-empty method taken from their own command", () => {
+test("new package-cache providers (yarn, bun, pip) are cheap and describe how they refill", () => {
   const yarn = restoreCostFor(candidate("package-caches", { provider: "yarn", target: { kind: "command", command: ["yarn", "cache", "clean"] } }));
   assert.equal(yarn.tier, "cheap");
   assert.equal(yarn.needsNetwork, true);
-  assert.equal(yarn.method, "yarn cache clean");
-  assert.notEqual(yarn.method, "");
+  assert.match(yarn.method, /refills on the next yarn/);
+  assert.ok(!yarn.method.includes("clean"), "restore method must not echo the cleanup command");
 
   const bun = restoreCostFor(candidate("package-caches", { provider: "bun", target: { kind: "command", command: ["bun", "pm", "cache", "rm"] } }));
   assert.equal(bun.tier, "cheap");
   assert.equal(bun.needsNetwork, true);
-  assert.equal(bun.method, "bun pm cache rm");
-  assert.notEqual(bun.method, "");
+  assert.match(bun.method, /refills on the next bun/);
+  assert.ok(!bun.method.includes("rm"), "restore method must not echo the cleanup command");
 
   const pip = restoreCostFor(candidate("package-caches", { provider: "pip", target: { kind: "command", command: ["pip3", "cache", "purge"] } }));
   assert.equal(pip.tier, "cheap");
   assert.equal(pip.needsNetwork, true);
-  assert.equal(pip.method, "pip3 cache purge");
-  assert.notEqual(pip.method, "");
+  assert.match(pip.method, /refills on the next pip/);
+  assert.ok(!pip.method.includes("purge"), "restore method must not echo the cleanup command");
 });
 
 test("project-dependencies with lockfile evidence is cheap", () => {
