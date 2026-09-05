@@ -62,11 +62,16 @@ test("saveConfig/loadConfig round-trip policy.worktreeRoots, normalized to absol
     const fresh = await loadConfig(env);
     assert.deepEqual(fresh.policy.worktreeRoots, [], "a brand new config starts with no worktree roots");
 
-    fresh.policy.worktreeRoots = ["relative/pool", "/already/absolute/pool"];
+    // Must be an absolute path on this platform, not a POSIX literal: on
+    // Windows path.resolve("/already/absolute/pool") maps onto the current
+    // drive and comes back as D:\already\absolute\pool, so a hardcoded
+    // "/..." is not already-absolute there.
+    const alreadyAbsolute = path.resolve(path.sep === "\\" ? "C:\\already\\absolute\\pool" : "/already/absolute/pool");
+    fresh.policy.worktreeRoots = ["relative/pool", alreadyAbsolute];
     await saveConfig(fresh, env);
 
     const reloaded = await loadConfig(env);
-    assert.deepEqual(reloaded.policy.worktreeRoots, [path.resolve("relative/pool"), "/already/absolute/pool"]);
+    assert.deepEqual(reloaded.policy.worktreeRoots, [path.resolve("relative/pool"), alreadyAbsolute]);
   } finally {
     await rm(env.XDG_CONFIG_HOME, { recursive: true, force: true });
   }
