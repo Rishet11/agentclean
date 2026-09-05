@@ -60,6 +60,9 @@ jobs:
       - name: Assert tests actually ran
         shell: bash
         run: |
-          count=$(node scripts/run-tests.mjs 2>&1 | grep -E '^# tests ' | awk '{print $3}')
+          # tr -d '\r' matters: on Windows the TAP line arrives as "# tests 222\r",
+          # so awk yields "222\r" and the numeric comparison below fails on a
+          # run where every test actually passed.
+          count=$(node scripts/run-tests.mjs 2>&1 | tr -d '\r' | grep -E '^# tests ' | awk '{print $3}')
           echo "test count: ${count:-0}"
           test "${count:-0}" -gt 0
