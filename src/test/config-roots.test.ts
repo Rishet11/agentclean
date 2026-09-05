@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -123,22 +124,32 @@ test("runConfig: removing a path that was never registered says so, and does not
 // ---------------------------------------------------------------------------
 
 test(
-  "runAuto install: a failing install (unsupported platform) leaves no config file behind as a side effect",
-  { skip: process.platform === "win32" ? "installScheduler is expected to succeed on win32; this test only proves the failure path" : false },
+  "runAuto install: a failing install leaves no config file behind as a side effect",
   async () => {
+    // This must never invoke a real scheduler install. An earlier version of
+    // this test relied on macOS being unsupported; once launchd support landed
+    // the install succeeded and wrote a real LaunchAgent into the developer's
+    // home directory. Use an interval the command rejects, which fails in
+    // validation before any platform work or any saveConfig.
     const isolatedConfigHome = await mkdtemp(path.join(os.tmpdir(), "agentclean-auto-install-"));
-    const saved = process.env.XDG_CONFIG_HOME;
+    const savedConfig = process.env.XDG_CONFIG_HOME;
+    const savedHome = process.env.HOME;
     process.env.XDG_CONFIG_HOME = isolatedConfigHome;
+    // Belt and braces: even if something did reach the platform layer, it must
+    // not be able to touch the real home directory.
+    process.env.HOME = isolatedConfigHome;
     try {
-      await assert.rejects(() => runAuto(["auto", "install"], baseOptions));
+      await assert.rejects(() => runAuto(["auto", "install"], { ...baseOptions, interval: "every-other-tuesday" }));
       const configFile = path.join(isolatedConfigHome, "agentclean", "config.json");
       await assert.rejects(
         () => readFile(configFile, "utf8"),
         /ENOENT/,
-        "install failed, so no config file should exist -- confirms install runs, and fails, before saveConfig",
+        "install failed, so no config file should exist -- confirms validation runs before saveConfig",
       );
+      assert.equal(existsSync(path.join(isolatedConfigHome, "Library", "LaunchAgents")), false, "no scheduler artifact may be written on a failed install");
     } finally {
-      process.env.XDG_CONFIG_HOME = saved;
+      process.env.XDG_CONFIG_HOME = savedConfig;
+      if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
       await rm(isolatedConfigHome, { recursive: true, force: true });
     }
   },
