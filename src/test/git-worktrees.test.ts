@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { runCommand } from "../core/command.js";
-import { GitWorktreeProvider } from "../providers/git.js";
+import { discoverWorktreePoolRoots, GitWorktreeProvider } from "../providers/git.js";
 import type { Candidate, ExecuteContext, Policy } from "../core/types.js";
 
 // The provider's own git calls (status, worktree list, submodule status,
@@ -296,6 +296,133 @@ test("submodule status: uninitialized (-) is harmless, but a checked-out commit 
     assert.equal(afterDirty.metadata?.dirtySubmodules, 1);
     assert.ok(afterDirty.blockers.includes("dirty-submodules"));
     assert.equal(afterDirty.eligible, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("discoverWorktreePoolRoots: several worktrees outside every root, sharing a parent, derive exactly that parent", async () => {
+  const root = await newRoot("agentclean-git-pools-multi-");
+  try {
+    const mainDir = path.join(root, "main");
+    await initRepo(mainDir);
+    const poolDir = path.join(root, "pool");
+    await addWorktree(mainDir, poolDir, "wt-1");
+    await addWorktree(mainDir, poolDir, "wt-2");
+    await addWorktree(mainDir, poolDir, "wt-3");
+
+    const pools = await discoverWorktreePoolRoots({ roots: [mainDir], home: path.join(root, "unrelated-home") });
+
+    assert.equal(pools.length, 1);
+    assert.equal(path.resolve(pools[0].root), path.resolve(poolDir));
+    assert.equal(pools[0].worktreeCount, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("discoverWorktreePoolRoots: exactly one out-of-root worktree derives that worktree's own parent directory, not the worktree itself", async () => {
+  const root = await newRoot("agentclean-git-pools-single-");
+  try {
+    const mainDir = path.join(root, "main");
+    await initRepo(mainDir);
+    const poolDir = path.join(root, "solo-pool");
+    const target = await addWorktree(mainDir, poolDir, "wt-solo");
+
+    const pools = await discoverWorktreePoolRoots({ roots: [mainDir], home: path.join(root, "unrelated-home") });
+
+    assert.equal(pools.length, 1);
+    assert.equal(path.resolve(pools[0].root), path.resolve(poolDir));
+    assert.notEqual(pools[0].root, target, "the pool directory, not the single worktree's own leaf path");
+    assert.equal(pools[0].worktreeCount, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("discoverWorktreePoolRoots: worktrees already inside an approved root are not evidence of anything -- nothing is derived", async () => {
+  const root = await newRoot("agentclean-git-pools-inroot-");
+  try {
+    const mainDir = path.join(root, "main");
+    await initRepo(mainDir);
+    await addWorktree(mainDir, root, "wt-inside"); // root itself is already an approved root below
+
+    const pools = await discoverWorktreePoolRoots({ roots: [root], home: path.join(path.dirname(root), "unrelated-home") });
+
+    assert.deepEqual(pools, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("discoverWorktreePoolRoots: real git evidence for a pool that would be unsafe to register (an ancestor of home) is not offered", async () => {
+  const root = await newRoot("agentclean-git-pools-guarded-");
+  try {
+    const mainDir = path.join(root, "main");
+    await initRepo(mainDir);
+    const poolDir = path.join(root, "dangerous-pool");
+    await addWorktree(mainDir, poolDir, "wt-danger");
+
+    // A contrived home nested *inside* the derived pool directory makes that
+    // pool directory an ancestor of home -- one of canRegisterRoot's refusal
+    // cases -- even though the worktree evidence backing it is entirely real.
+    const dangerousHome = path.join(poolDir, "nested", "home");
+    const pools = await discoverWorktreePoolRoots({ roots: [mainDir], home: dangerousHome });
+
+    assert.deepEqual(pools, [], "real evidence exists, but registering it would be unsafe, so nothing is offered");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a pool root derived from git evidence, once folded into context.roots, unblocks the worktrees under it without weakening any other protection", async () => {
+  const root = await newRoot("agentclean-git-pools-protection-");
+  try {
+    const mainDir = path.join(root, "main");
+    await initRepo(mainDir);
+    const poolDir = path.join(root, "pool");
+    const clean = await addWorktree(mainDir, poolDir, "wt-clean");
+    const dirty = await addWorktree(mainDir, poolDir, "wt-dirty");
+    const locked = await addWorktree(mainDir, poolDir, "wt-locked");
+    await writeFile(path.join(dirty, "file.txt"), "changed\n");
+    await gitOk(["worktree", "lock", locked, "--reason", "test-lock"], mainDir);
+
+    const initialContext = makeContext([mainDir], mainDir);
+    const provider = new GitWorktreeProvider();
+
+    // Before registration: all three are outside the only approved root
+    // (mainDir), on top of whatever else is true about them.
+    const before = await provider.discover(initialContext);
+    assert.equal(before.length, 3);
+    for (const candidate of before) {
+      assert.ok(candidate.blockers.includes("outside-allowed-root"), `${candidate.metadata?.worktreePath} should be blocked as outside-allowed-root before registration`);
+      assert.equal(candidate.eligible, false);
+    }
+
+    const pools = await discoverWorktreePoolRoots({ roots: initialContext.roots, home: initialContext.home });
+    assert.equal(pools.length, 1);
+    assert.equal(pools[0].worktreeCount, 3);
+
+    const registeredContext: ExecuteContext = { ...initialContext, roots: [...initialContext.roots, pools[0].root] };
+    const after = await provider.discover(registeredContext);
+    assert.equal(after.length, 3);
+
+    const cleanAfter = candidateFor(after, clean);
+    assert.equal(cleanAfter.blockers.includes("outside-allowed-root"), false);
+    assert.deepEqual(cleanAfter.blockers, []);
+    assert.equal(cleanAfter.eligible, true);
+
+    const dirtyAfter = candidateFor(after, dirty);
+    assert.equal(dirtyAfter.blockers.includes("outside-allowed-root"), false, "no longer blocked for being outside the root");
+    assert.ok(dirtyAfter.blockers.includes("dirty-or-untracked"), "but still blocked for being dirty");
+    assert.equal(dirtyAfter.eligible, false);
+
+    const lockedAfter = candidateFor(after, locked);
+    assert.equal(lockedAfter.blockers.includes("outside-allowed-root"), false);
+    assert.ok(lockedAfter.blockers.includes("locked"));
+    assert.equal(lockedAfter.eligible, false);
+
+    assert.equal(after.some((candidate) => candidate.metadata?.worktreePath === mainDir), false, "the main worktree must never appear, registered pool or not");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
