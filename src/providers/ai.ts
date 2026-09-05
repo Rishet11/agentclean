@@ -162,36 +162,181 @@ class AntigravityProvider implements StorageProvider {
   }
 }
 
-/** Not wired into registry.ts yet — that happens at merge time (see brief). */
+/** Wired into registry.ts. */
 export function antigravityProvider(): StorageProvider {
   return new AntigravityProvider();
 }
 
 // ---------------------------------------------------------------------------
-// Cline (VS Code / Cursor extension) — stays diagnostic-only
+// Cline (VS Code-family extension) — verified, report-only history
 // ---------------------------------------------------------------------------
 
-export function clineProvider(): DiagnosticProvider {
-  return new DiagnosticProvider("cline", "Cline", (context) => {
-    // Verified: extension id is `saoudrizwan.claude-dev` (github.com/cline/cline;
-    // the rebrand from "Claude Dev" kept the original id). VS Code / Cursor store
-    // per-extension data at <editor-user-data>/User/globalStorage/<extension-id>,
-    // a well-known Code/Cursor convention. What is NOT verified: which of these
-    // editors (or VSCodium, or another fork) the user actually has Cline installed
-    // in — that depends on the machine, and `~/.cline` does not exist on the one
-    // this was measured on. Stays diagnostic-only until an install is confirmed.
-    const globalStorage = (editorRoot: string) => path.join(editorRoot, "User", "globalStorage", "saoudrizwan.claude-dev");
-    if (process.platform === "win32") {
-      const appData = context.env.APPDATA || path.join(context.home, "AppData", "Roaming");
-      return [globalStorage(path.join(appData, "Code")), globalStorage(path.join(appData, "Cursor"))];
+/**
+ * Verified: extension id is `saoudrizwan.claude-dev` (github.com/cline/cline;
+ * the rebrand from "Claude Dev" kept the original id). Every host below is an
+ * Electron app whose per-extension data lives at
+ * `<editor-user-data>/User/globalStorage/<extension-id>` — the standard
+ * VS Code / Code-fork convention (code.visualstudio.com/docs/getstarted/settings
+ * documents it for VS Code itself; the same shape is confirmed per-fork below).
+ *
+ * Per-platform user-data folder name for each host, all under the same base
+ * as VS Code's own ("Code"): Windows `%APPDATA%\<name>`, macOS
+ * `~/Library/Application Support/<name>`, Linux `${XDG_CONFIG_HOME:-~/.config}/<name>`.
+ *  - "Code"            VS Code itself.
+ *  - "Code - Insiders"  confirmed via github.com/microsoft/vscode#112846
+ *                        ("%appdata%\Code - Insiders").
+ *  - "Cursor"           confirmed via Cursor's own CLI configuration docs
+ *                        (see cursorRoot below).
+ *  - "VSCodium"         confirmed via VSCodium's own usage docs
+ *                        (github.com/VSCodium/vscodium/blob/master/docs/usage.md).
+ *  - "Windsurf"         UNVERIFIED against an official Windsurf/Codeium doc
+ *                        page (none was found describing its data directory);
+ *                        community references (a DeepWiki technical wiki and a
+ *                        third-party install guide) independently describe the
+ *                        same `.../Windsurf/User/globalStorage/...` shape as
+ *                        every other fork here, which is what an Electron app
+ *                        named "Windsurf" gets by default, so it is included
+ *                        on that basis rather than left out — worst case it
+ *                        simply finds nothing on a Windsurf machine, the same
+ *                        safe degradation as any other absent host below.
+ */
+const clineHostEditors = ["Code", "Code - Insiders", "Cursor", "VSCodium", "Windsurf"] as const;
+const CLINE_EXTENSION_ID = "saoudrizwan.claude-dev";
+
+function clineEditorUserData(editorName: string, context: ExecuteContext): string {
+  if (process.platform === "win32") return path.join(context.env.APPDATA || path.join(context.home, "AppData", "Roaming"), editorName);
+  if (process.platform === "darwin") return path.join(context.home, "Library", "Application Support", editorName);
+  return path.join(context.env.XDG_CONFIG_HOME || path.join(context.home, ".config"), editorName);
+}
+
+function clineGlobalStorageRoots(context: ExecuteContext): string[] {
+  return clineHostEditors.map((editorName) => path.join(clineEditorUserData(editorName, context), "User", "globalStorage", CLINE_EXTENSION_ID));
+}
+
+/**
+ * What lives inside `globalStorage/saoudrizwan.claude-dev` (Cline does not
+ * publish a data-directory reference page, so this is verified against the
+ * project's own GitHub issues rather than a docs site):
+ *  - `state/taskHistory.json` — index of every task (cline/cline#7742).
+ *  - `tasks/<task-id>/{api_conversation_history.json, ui_messages.json,
+ *    task_metadata.json}` — the conversation transcripts themselves
+ *    (cline/cline#7742).
+ *  - `checkpoints/` — per-task shadow git repositories used to restore file
+ *    state mid-task (cline/cline#3790; docs.cline.bot/features/checkpoints
+ *    confirms checkpoints "persist throughout a conversation task" and are
+ *    used to "restore to any point in a task"). Tied 1:1 to a task. A user
+ *    report (cline/cline#4388) describes multi-GB checkpoints for a single
+ *    task — that figure is one person's report, not a published spec, so
+ *    treat it as illustrative of scale, not an exact number.
+ *  - `settings/cline_mcp_settings.json` — live MCP server configuration
+ *    (cline/cline#9663). Never a candidate, never even measured: only the
+ *    three history paths above are ever read by discoverOne below.
+ * No subdirectory here is documented as a disposable cache distinct from
+ * task data (unlike Codex, which has both real caches and history under the
+ * same root) — every byte Cline reports is history, so unlike Codex this
+ * provider has nothing eligible for deletion at all, the same shape as
+ * AntigravityProvider above.
+ */
+const clineHistorySubpaths = {
+  taskHistory: ["state", "taskHistory.json"],
+  tasks: ["tasks"],
+  checkpoints: ["checkpoints"],
+} as const;
+
+class ClineProvider implements StorageProvider {
+  readonly status = "verified" as const;
+  readonly id = "cline";
+  readonly name = "Cline";
+
+  async detect(context: ExecuteContext): Promise<ProviderDetection> {
+    const roots = clineGlobalStorageRoots(context);
+    let found: string | undefined;
+    let count = 0;
+    for (const root of roots) {
+      // eslint-disable-next-line no-await-in-loop -- small, fixed candidate list
+      if (await safeRealPath(root)) {
+        count += 1;
+        if (!found) found = root;
+      }
     }
-    if (process.platform === "darwin") {
-      const appSupport = path.join(context.home, "Library", "Application Support");
-      return [globalStorage(path.join(appSupport, "Code")), globalStorage(path.join(appSupport, "Cursor"))];
+    return {
+      id: this.id,
+      name: this.name,
+      status: this.status,
+      details: found ? `documented data root present (${count} host editor install${count === 1 ? "" : "s"})` : "no host editor install found",
+      root: found,
+      capabilities: ["ai-history:tasks+checkpoints"],
+    };
+  }
+
+  private async discoverOne(root: string): Promise<Candidate | undefined> {
+    if (!(await safeRealPath(root))) return undefined;
+    const taskHistoryPath = path.join(root, ...clineHistorySubpaths.taskHistory);
+    const tasksPath = path.join(root, ...clineHistorySubpaths.tasks);
+    const checkpointsPath = path.join(root, ...clineHistorySubpaths.checkpoints);
+    const [taskHistoryMeasured, tasksMeasured, checkpointsMeasured] = await Promise.all([
+      measureTree(taskHistoryPath).catch(() => undefined),
+      measureTree(tasksPath).catch(() => undefined),
+      measureTree(checkpointsPath).catch(() => undefined),
+    ]);
+    if (!taskHistoryMeasured && !tasksMeasured && !checkpointsMeasured) return undefined;
+    const anchor = tasksMeasured ? tasksPath : checkpointsMeasured ? checkpointsPath : taskHistoryPath;
+    let stats;
+    try {
+      stats = await lstat(anchor);
+    } catch {
+      return undefined;
     }
-    const xdgConfig = context.env.XDG_CONFIG_HOME || path.join(context.home, ".config");
-    return [globalStorage(path.join(xdgConfig, "Code")), globalStorage(path.join(xdgConfig, "Cursor"))];
-  });
+    const evidence = ["saoudrizwan.claude-dev is Cline's documented extension id (github.com/cline/cline)"];
+    if (tasksMeasured) evidence.push(`tasks/: ${tasksMeasured.fileCount} files (cline/cline#7742)`);
+    if (checkpointsMeasured) evidence.push(`checkpoints/: ${checkpointsMeasured.fileCount} files, shadow git repos tied to tasks (cline/cline#3790, docs.cline.bot/features/checkpoints)`);
+    if (taskHistoryMeasured) evidence.push("state/taskHistory.json present (cline/cline#7742)");
+    return {
+      id: hashValue({ provider: this.id, target: root, category: "ai-history" }).slice(0, 16),
+      provider: this.id,
+      providerStatus: this.status,
+      category: "ai-history",
+      action: "delete",
+      target: { kind: "path", path: anchor },
+      reason: "Cline task history and checkpoints",
+      evidence,
+      bytes: (taskHistoryMeasured?.bytes ?? 0) + (tasksMeasured?.bytes ?? 0) + (checkpointsMeasured?.bytes ?? 0),
+      fileCount: (taskHistoryMeasured?.fileCount ?? 0) + (tasksMeasured?.fileCount ?? 0) + (checkpointsMeasured?.fileCount ?? 0),
+      mtimeMs: stats.mtimeMs,
+      fingerprint: fingerprintFromStats(stats),
+      eligible: false,
+      blockers: [HISTORY_BLOCKER, "grouped-across-task-and-checkpoint-directories"],
+      autoSafe: false,
+      partialMeasurement: tasksMeasured?.partial || checkpointsMeasured?.partial || taskHistoryMeasured?.partial,
+      metadata: { root },
+    };
+  }
+
+  async discover(context: ExecuteContext): Promise<Candidate[]> {
+    const candidates: Candidate[] = [];
+    for (const root of clineGlobalStorageRoots(context)) {
+      // eslint-disable-next-line no-await-in-loop -- small, fixed candidate list
+      const candidate = await this.discoverOne(root);
+      if (candidate) candidates.push(candidate);
+    }
+    return candidates;
+  }
+
+  explain(candidate: Candidate): string {
+    return `${candidate.reason}. Never includes settings/cline_mcp_settings.json (live MCP config), and history is report-only until an explicit opt-in exists.`;
+  }
+
+  async revalidate(): Promise<Validation> {
+    return { ok: false, reason: HISTORY_BLOCKER };
+  }
+
+  async execute(): Promise<ActionResult> {
+    return { ok: false, bytes: 0, reason: HISTORY_BLOCKER };
+  }
+}
+
+export function clineProvider(): StorageProvider {
+  return new ClineProvider();
 }
 
 // ---------------------------------------------------------------------------
@@ -219,8 +364,11 @@ export function opencodeProvider(): FilesystemProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic provider base (kept for Cline — see clineProvider above — and any
-// future provider whose deletion semantics can't be verified yet).
+// Diagnostic provider base: the designated fallback for a provider whose
+// storage location or deletion semantics can't yet be confidently verified —
+// Cline used this until its host-editor storage and extension id were
+// confirmed (see clineProvider above, now a verified report-only provider).
+// Kept for the next provider that lands in the same unverified state.
 // ---------------------------------------------------------------------------
 
 export class DiagnosticProvider implements StorageProvider {

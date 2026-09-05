@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { claudeProvider, codexProvider, cursorProvider } from "../providers/ai.js";
+import { claudeProvider, clineProvider, codexProvider, cursorProvider } from "../providers/ai.js";
 import { isWithin } from "../core/paths.js";
 import type { ExecuteContext } from "../core/types.js";
 
@@ -112,5 +112,35 @@ test("SAFETY: cursor never scans ~/.cursor at all (its root is the platform app-
   for (const candidate of candidates) {
     if (candidate.target.kind !== "path") continue;
     assert.ok(!candidate.target.path.startsWith(path.join(home, ".cursor")));
+  }
+});
+
+async function withPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try {
+    return await fn();
+  } finally {
+    Object.defineProperty(process, "platform", original);
+  }
+}
+
+test("SAFETY: cline never surfaces settings/cline_mcp_settings.json (live MCP config) even though it sits next to real task history", async () => {
+  const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-credentials-cline-")));
+  const root = path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  await mkdir(path.join(root, "tasks", "task-1"), { recursive: true });
+  await writeFile(path.join(root, "tasks", "task-1", "api_conversation_history.json"), "x".repeat(40));
+  await mkdir(path.join(root, "checkpoints", "task-1"), { recursive: true });
+  await writeFile(path.join(root, "checkpoints", "task-1", "shadow-git-data"), "x".repeat(30));
+  await mkdir(path.join(root, "settings"), { recursive: true });
+  await writeFile(path.join(root, "settings", "cline_mcp_settings.json"), "live mcp config, never a candidate");
+  await utimes(path.join(root, "settings", "cline_mcp_settings.json"), VERY_OLD, VERY_OLD);
+
+  const candidates = await withPlatform("darwin", () => clineProvider().discover(context(home)));
+  assert.ok(candidates.length > 0, "expected the real task history to still surface as a report-only candidate");
+  for (const candidate of candidates) {
+    assert.equal(candidate.target.kind, "path");
+    if (candidate.target.kind !== "path") continue;
+    assert.ok(!candidate.target.path.includes(`${path.sep}settings${path.sep}`) && !candidate.target.path.endsWith("settings"));
   }
 });
