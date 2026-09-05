@@ -52,17 +52,9 @@ jobs:
 
       - run: npm test
 
+      # The test script was once a shell glob, which cmd.exe does not expand,
+      # so a Windows leg could be green while running zero tests. The guard
+      # against that now lives in scripts/run-tests.mjs, which exits non-zero
+      # when it finds no test files. That works on every platform, unlike a
+      # shell assertion that has to cope with CRLF in TAP output.
       - run: npm run pack:check
-
-      # The test script used to be a shell glob, which cmd.exe does not expand,
-      # so this leg would have been green while running nothing. Assert a
-      # non-zero test count so that failure mode cannot come back.
-      - name: Assert tests actually ran
-        shell: bash
-        run: |
-          # tr -d '\r' matters: on Windows the TAP line arrives as "# tests 222\r",
-          # so awk yields "222\r" and the numeric comparison below fails on a
-          # run where every test actually passed.
-          count=$(node scripts/run-tests.mjs 2>&1 | tr -d '\r' | grep -E '^# tests ' | awk '{print $3}')
-          echo "test count: ${count:-0}"
-          test "${count:-0}" -gt 0
