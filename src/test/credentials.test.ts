@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { claudeProvider, clineProvider, codexProvider, cursorProvider } from "../providers/ai.js";
+import { cargoProvider, gradleProvider } from "../providers/package-caches.js";
 import { isWithin } from "../core/paths.js";
 import type { ExecuteContext } from "../core/types.js";
 
@@ -142,5 +143,41 @@ test("SAFETY: cline never surfaces settings/cline_mcp_settings.json (live MCP co
     assert.equal(candidate.target.kind, "path");
     if (candidate.target.kind !== "path") continue;
     assert.ok(!candidate.target.path.includes(`${path.sep}settings${path.sep}`) && !candidate.target.path.endsWith("settings"));
+  }
+});
+
+test("SAFETY: cargo never surfaces credentials.toml/config.toml even though they sit next to the real cache directories", async () => {
+  const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-credentials-cargo-")));
+  const cargoHome = path.join(home, ".cargo");
+  await mkdir(path.join(cargoHome, "registry", "cache"), { recursive: true });
+  await writeFile(path.join(cargoHome, "registry", "cache", "entry"), "x".repeat(20));
+  await writeFile(path.join(cargoHome, "credentials.toml"), "registry auth token, never a candidate");
+  await writeFile(path.join(cargoHome, "config.toml"), "cargo config, never a candidate");
+  await utimes(path.join(cargoHome, "credentials.toml"), VERY_OLD, VERY_OLD);
+  await utimes(path.join(cargoHome, "config.toml"), VERY_OLD, VERY_OLD);
+
+  const candidates = await cargoProvider().discover(context(home));
+  assert.ok(candidates.length > 0, "expected the real registry cache to still surface");
+  for (const candidate of candidates) {
+    assert.equal(candidate.target.kind, "path");
+    if (candidate.target.kind !== "path") continue;
+    assert.ok(!candidate.target.path.endsWith("credentials.toml") && !candidate.target.path.endsWith("config.toml"));
+  }
+});
+
+test("SAFETY: gradle never surfaces gradle.properties even though it sits next to the real caches directory", async () => {
+  const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-credentials-gradle-")));
+  const gradleHome = path.join(home, ".gradle");
+  await mkdir(path.join(gradleHome, "caches", "modules-2"), { recursive: true });
+  await writeFile(path.join(gradleHome, "caches", "modules-2", "entry"), "x".repeat(20));
+  await writeFile(path.join(gradleHome, "gradle.properties"), "possibly holds credentials, never a candidate");
+  await utimes(path.join(gradleHome, "gradle.properties"), VERY_OLD, VERY_OLD);
+
+  const candidates = await gradleProvider().discover(context(home));
+  assert.ok(candidates.length > 0, "expected the real modules-2 cache to still surface");
+  for (const candidate of candidates) {
+    assert.equal(candidate.target.kind, "path");
+    if (candidate.target.kind !== "path") continue;
+    assert.ok(!candidate.target.path.endsWith("gradle.properties"));
   }
 });

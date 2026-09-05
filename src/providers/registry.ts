@@ -2,11 +2,11 @@ import type { StorageProvider } from "../core/types.js";
 import { antigravityProvider, claudeProvider, clineProvider, codexProvider, cursorProvider, geminiProvider, opencodeProvider } from "./ai.js";
 import { GitWorktreeProvider } from "./git.js";
 import { npmProvider, pnpmProvider } from "./command.js";
-import { bunProvider, goProvider, pipProvider, uvProvider, yarnProvider } from "./package-caches.js";
+import { bunProvider, cargoProvider, goProvider, gradleProvider, pipProvider, uvProvider, yarnProvider } from "./package-caches.js";
 import { ProjectArtifactProvider } from "./project.js";
 
 export function providers(): StorageProvider[] {
-  return [new GitWorktreeProvider(), new ProjectArtifactProvider(), claudeProvider(), geminiProvider(), antigravityProvider(), clineProvider(), opencodeProvider(), codexProvider(), cursorProvider(), npmProvider(), pnpmProvider(), uvProvider(), goProvider(), yarnProvider(), bunProvider(), pipProvider()];
+  return [new GitWorktreeProvider(), new ProjectArtifactProvider(), claudeProvider(), geminiProvider(), antigravityProvider(), clineProvider(), opencodeProvider(), codexProvider(), cursorProvider(), npmProvider(), pnpmProvider(), uvProvider(), goProvider(), yarnProvider(), bunProvider(), pipProvider(), cargoProvider(), gradleProvider()];
 }
 
 export function providerMap(): Map<string, StorageProvider> {
