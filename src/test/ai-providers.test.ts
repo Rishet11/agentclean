@@ -188,37 +188,116 @@ test("cursor: resolves the real per-platform IDE data root, never ~/.cursor/exte
 });
 
 // ---------------------------------------------------------------------------
-// Cline — stays diagnostic-only
+// Cline — verified, report-only task history across VS Code-family hosts
 // ---------------------------------------------------------------------------
 
-test("cline: diagnostic-only, finds a plausible root but never discovers/deletes anything", async () => {
-  const home = await tmpHome("agentclean-cline-");
-  const provider = clineProvider();
+interface ClineFixtureOptions {
+  taskHistory?: boolean;
+  tasks?: boolean;
+  checkpoints?: boolean;
+  settings?: boolean;
+}
 
-  const emptyDetection = await withPlatform("darwin", () => provider.detect(context(home)));
-  assert.equal(emptyDetection.status, "diagnostic");
-  assert.equal(emptyDetection.root, undefined);
+async function makeClineInstall(root: string, opts: ClineFixtureOptions = {}): Promise<void> {
+  const { taskHistory = true, tasks = true, checkpoints = true, settings = true } = opts;
+  await mkdir(root, { recursive: true });
+  if (taskHistory) {
+    await mkdir(path.join(root, "state"), { recursive: true });
+    await writeFile(path.join(root, "state", "taskHistory.json"), "x".repeat(10));
+  }
+  if (tasks) {
+    await mkdir(path.join(root, "tasks", "task-1"), { recursive: true });
+    await writeFile(path.join(root, "tasks", "task-1", "api_conversation_history.json"), "x".repeat(40));
+    await writeFile(path.join(root, "tasks", "task-1", "ui_messages.json"), "x".repeat(20));
+  }
+  if (checkpoints) {
+    await mkdir(path.join(root, "checkpoints", "task-1"), { recursive: true });
+    await writeFile(path.join(root, "checkpoints", "task-1", "shadow-git-data"), "x".repeat(30));
+  }
+  if (settings) {
+    await mkdir(path.join(root, "settings"), { recursive: true });
+    await writeFile(path.join(root, "settings", "cline_mcp_settings.json"), "live mcp config, never a candidate");
+  }
+}
 
-  await mkdir(path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev"), { recursive: true });
-  const found = await withPlatform("darwin", () => provider.detect(context(home)));
-  assert.equal(found.status, "diagnostic");
-  assert.ok(found.root?.includes("saoudrizwan.claude-dev"));
+function clineRoot(home: string, editorRoot: string[]): string {
+  return path.join(home, ...editorRoot, "User", "globalStorage", "saoudrizwan.claude-dev");
+}
 
-  assert.deepEqual(await provider.discover(), []);
-  assert.equal((await provider.revalidate()).ok, false);
-  assert.equal((await provider.execute()).ok, false);
+test("cline: detect() finds nothing and discover() is empty on a machine with no host editor install", async () => {
+  const home = await tmpHome("agentclean-cline-none-");
+  const detection = await withPlatform("darwin", () => clineProvider().detect(context(home)));
+  assert.equal(detection.status, "verified");
+  assert.equal(detection.root, undefined);
+  assert.deepEqual(await withPlatform("darwin", () => clineProvider().discover(context(home))), []);
 });
 
-test("cline: resolves under Cursor's globalStorage on Linux, and APPDATA on Windows", async () => {
+test("cline: task history + checkpoints are one report-only ai-history candidate; settings/cline_mcp_settings.json is never touched", async () => {
+  const home = await tmpHome("agentclean-cline-");
+  const root = clineRoot(home, ["Library", "Application Support", "Code"]);
+  await makeClineInstall(root);
+
+  const detection = await withPlatform("darwin", () => clineProvider().detect(context(home)));
+  assert.equal(detection.status, "verified");
+  assert.ok(detection.root?.includes("saoudrizwan.claude-dev"));
+
+  const candidates = await withPlatform("darwin", () => clineProvider().discover(context(home)));
+  assert.equal(candidates.length, 1);
+  const [candidate] = candidates;
+  assert.equal(candidate.category, "ai-history");
+  assert.equal(candidate.eligible, false);
+  assert.ok(candidate.blockers.includes(HISTORY_BLOCKER));
+  assert.ok(candidate.bytes > 0);
+  assert.ok(!targetPath(candidate).includes(`${path.sep}settings${path.sep}`) && !targetPath(candidate).endsWith("settings"));
+
+  const revalidation = await clineProvider().revalidate(candidate, context(home));
+  assert.equal(revalidation.ok, false);
+  const execution = await clineProvider().execute(candidate, context(home));
+  assert.equal(execution.ok, false);
+});
+
+test("cline: resolves Code, Code - Insiders, Cursor, VSCodium, and Windsurf identically on macOS", async () => {
+  for (const editorName of ["Code", "Code - Insiders", "Cursor", "VSCodium", "Windsurf"]) {
+    const home = await tmpHome("agentclean-cline-editors-");
+    const root = clineRoot(home, ["Library", "Application Support", editorName]);
+    await makeClineInstall(root);
+    const candidates = await withPlatform("darwin", () => clineProvider().discover(context(home)));
+    assert.equal(candidates.length, 1, `expected a candidate for ${editorName}`);
+    assert.ok(targetPath(candidates[0]).startsWith(root), `candidate for ${editorName} should be under its own root`);
+  }
+});
+
+test("cline: resolves under Cursor's globalStorage on Linux (XDG_CONFIG_HOME default), and APPDATA on Windows", async () => {
   const home = await tmpHome("agentclean-cline-linux-");
-  await mkdir(path.join(home, ".config", "Cursor", "User", "globalStorage", "saoudrizwan.claude-dev"), { recursive: true });
-  const linuxDetection = await withPlatform("linux", () => clineProvider().detect(context(home)));
-  assert.ok(linuxDetection.root?.startsWith(path.join(home, ".config", "Cursor")));
+  const linuxRoot = clineRoot(home, [".config", "Cursor"]);
+  await makeClineInstall(linuxRoot);
+  const linuxCandidates = await withPlatform("linux", () => clineProvider().discover(context(home)));
+  assert.equal(linuxCandidates.length, 1);
+  assert.ok(targetPath(linuxCandidates[0]).startsWith(path.join(home, ".config", "Cursor")));
 
   const appData = await tmpHome("agentclean-cline-appdata-");
-  await mkdir(path.join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev"), { recursive: true });
-  const winDetection = await withPlatform("win32", () => clineProvider().detect(context(home, { APPDATA: appData })));
-  assert.ok(winDetection.root?.startsWith(appData));
+  const winRoot = clineRoot(appData, ["Code"]);
+  await makeClineInstall(winRoot);
+  const winCandidates = await withPlatform("win32", () => clineProvider().discover(context(home, { APPDATA: appData })));
+  assert.equal(winCandidates.length, 1);
+  assert.ok(targetPath(winCandidates[0]).startsWith(appData));
+});
+
+test("cline: two simultaneous installs (Code and Cursor) each produce their own report-only candidate", async () => {
+  const home = await tmpHome("agentclean-cline-multi-");
+  await makeClineInstall(clineRoot(home, ["Library", "Application Support", "Code"]));
+  await makeClineInstall(clineRoot(home, ["Library", "Application Support", "Cursor"]));
+  const candidates = await withPlatform("darwin", () => clineProvider().discover(context(home)));
+  assert.equal(candidates.length, 2);
+  assert.ok(candidates.every((c) => c.category === "ai-history" && c.eligible === false));
+});
+
+test("cline: an installed extension with no task data at all contributes nothing", async () => {
+  const home = await tmpHome("agentclean-cline-empty-");
+  const root = clineRoot(home, ["Library", "Application Support", "Code"]);
+  await mkdir(root, { recursive: true }); // extension folder exists, but Cline never ran a task
+  const candidates = await withPlatform("darwin", () => clineProvider().discover(context(home)));
+  assert.deepEqual(candidates, []);
 });
 
 // ---------------------------------------------------------------------------
