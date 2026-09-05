@@ -13,7 +13,8 @@ import { executePlan } from "./core/executor.js";
 import { autoPlan } from "./core/auto.js";
 import { createPlan, loadPlan, savePlan } from "./core/plan.js";
 import { purgeExpired, purgeRun, quarantineRootDir, restoreRun } from "./core/quarantine.js";
-import { displayPath, stateDir } from "./core/paths.js";
+import { displayPath, samePath, stateDir } from "./core/paths.js";
+import { measureTree } from "./core/filesystem.js";
 import { buildReport } from "./core/report.js";
 import { runChecklist } from "./ui/checklist.js";
 import { formatBytes, humanFailure, shortLabelForCandidate } from "./core/output.js";
@@ -22,8 +23,9 @@ import { scanProviders } from "./core/scan.js";
 import { latestManifest } from "./core/manifest.js";
 import { createProgress } from "./ui/progress.js";
 import { providerMap, providers } from "./providers/registry.js";
+import { discoverWorktreePoolRoots } from "./providers/git.js";
 import { installScheduler, schedulerStatus, uninstallScheduler } from "./platform/scheduler.js";
-import type { Plan, RunResult } from "./core/types.js";
+import type { ConfigFile, ExecuteContext, Plan, RunResult } from "./core/types.js";
 
 const require = createRequire(import.meta.url);
 
@@ -33,7 +35,7 @@ class UsageError extends Error {
   }
 }
 
-interface Options {
+export interface Options {
   json: boolean;
   dryRun: boolean;
   yes: boolean;
@@ -102,6 +104,7 @@ Less common:
   agentclean explain <candidate-id>    why one item was flagged (needs --plan)
   agentclean doctor                    diagnostics for a bug report
   agentclean config root add <path>    remember a folder for every future scan
+  agentclean config root remove <path> forget a folder (also undoes auto-added ones)
   agentclean purge                     free held space now instead of waiting
   agentclean auto install --interval <weekly|...>   set up scheduled cleanup
   agentclean auto uninstall | status   manage scheduled cleanup
@@ -150,9 +153,57 @@ async function writeOutput(value: unknown, options: Options, output: NodeJS.Writ
   output.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+/** Plain-language disclosure for `registerDiscoveredWorktreePools`: printed in
+ * full every time it registers something (never silently), using this
+ * codebase's existing "spare copy", never "worktree", vocabulary (see
+ * core/output.ts's shortLabel). */
+export function printNewlyRegisteredPools(pools: Array<{ root: string; worktreeCount: number; bytes: number }>, output: NodeJS.WritableStream): void {
+  if (pools.length === 0) return;
+  output.write(`\n  Added ${pools.length} folder${pools.length === 1 ? "" : "s"} from git's own records:\n`);
+  for (const pool of pools) {
+    const copies = pool.worktreeCount === 1 ? "1 spare copy" : `${pool.worktreeCount} spare copies`;
+    output.write(`    ${displayPath(pool.root)}      ${copies}, ${formatBytes(pool.bytes)}\n`);
+  }
+  output.write("  Undo:  agentclean config root remove <path>\n\n");
+}
+
+/**
+ * The owner chose "add the folder for you" over relaxing the
+ * outside-allowed-root rule, so a linked worktree that git itself reports
+ * (`git worktree list --porcelain`, via providers/git.ts's
+ * discoverWorktreePoolRoots) can still get approved -- legitimately, by
+ * widening `config.policy.worktreeRoots`, not by weakening the check.
+ *
+ * Runs on every fresh scan (never against a loaded `--plan`, which is not a
+ * scan): cheap on repeat runs, since a pool already folded into
+ * `context.roots` (see core/context.ts's makeContext) no longer has any
+ * worktree outside the roots to rediscover, and `known` skips re-saving and
+ * re-printing anything already in policy.worktreeRoots regardless. Mutates
+ * `context.roots` in place so *this* run's scan already sees the new root,
+ * not just the next one -- the entire point is not requiring a second
+ * invocation to actually free the space.
+ */
+async function registerDiscoveredWorktreePools(config: ConfigFile, context: ExecuteContext, options: Options): Promise<void> {
+  const pools = await discoverWorktreePoolRoots({ roots: context.roots, home: context.home });
+  if (pools.length === 0) return;
+  const known = new Set(config.policy.worktreeRoots.map((root) => path.resolve(root)));
+  const fresh = pools.filter((pool) => !known.has(path.resolve(pool.root)));
+  if (fresh.length === 0) return;
+  config.policy.worktreeRoots = [...config.policy.worktreeRoots, ...fresh.map((pool) => pool.root)];
+  await saveConfig(config);
+  context.roots = [...new Set([...context.roots, ...fresh.map((pool) => pool.root)])];
+  if (options.json) return;
+  const withBytes = await Promise.all(fresh.map(async (pool) => ({
+    ...pool,
+    bytes: (await measureTree(pool.root).catch(() => undefined))?.bytes ?? 0,
+  })));
+  printNewlyRegisteredPools(withBytes, stdout);
+}
+
 async function runScan(options: Options, autoOnly = false): Promise<number> {
   const config = await loadConfig();
   const context = await makeContextWithDiscoveredRoots(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
+  await registerDiscoveredWorktreePools(config, context, options);
   const map = providerMap();
   const plan = await scanProviders([...map.values()], context, { category: options.category, provider: options.provider });
   const filtered = autoOnly ? autoPlan(plan, config.policy, context.now) : plan;
@@ -168,6 +219,10 @@ async function runClean(options: Options, autoOnly = false): Promise<number> {
   const context = await makeContextWithDiscoveredRoots(config, options.roots, process.cwd(), process.env, options.projectArtifacts || Boolean(options.category && ["project-dependencies", "project-environments", "build-artifacts"].includes(options.category)));
   const map = providerMap();
   if (autoOnly && options.plan) throw new UsageError("auto mode always scans a fresh plan; --plan is not allowed");
+  // A loaded --plan is not a scan (nothing below re-derives anything), so it
+  // never triggers registration; running it against a fresh scan only would
+  // silently miss auto --once, which always takes this branch.
+  if (!options.plan) await registerDiscoveredWorktreePools(config, context, options);
   const plan = options.plan ? await loadPlan(path.resolve(options.plan)) : await scanProviders([...map.values()], context, { category: options.category, provider: options.provider });
   const selected = autoOnly ? autoPlan(plan, config.policy, context.now) : plan;
   if (!options.json) (options.verbose ? printPlan : printSummary)(selected, stdout);
@@ -329,23 +384,51 @@ async function runDoctor(options: Options): Promise<number> {
   return EXIT_OK;
 }
 
-async function runConfig(positionals: string[], options: Options): Promise<number> {
-  if (positionals[0] !== "config" || positionals[1] !== "root" || positionals[2] !== "add" || !positionals[3]) throw new UsageError("usage: agentclean config root add <path>");
+/**
+ * `add` only ever touched `config.roots`. `remove` undoes either kind of
+ * root this tool can register -- a manually-added one (`config.roots`) or
+ * one `registerDiscoveredWorktreePools` derived from git evidence
+ * (`config.policy.worktreeRoots`) -- since core/context.ts's makeContext
+ * folds both into `context.roots` identically; from the user's side "root"
+ * is one concept, split into two arrays only as an implementation detail.
+ */
+export async function runConfig(positionals: string[], options: Options): Promise<number> {
+  const usageMessage = "usage: agentclean config root add <path> | agentclean config root remove <path>";
+  if (positionals[0] !== "config" || positionals[1] !== "root" || !positionals[3]) throw new UsageError(usageMessage);
   const config = await loadConfig();
   const root = path.resolve(positionals[3]);
-  if (!config.roots.includes(root)) config.roots.push(root);
-  await saveConfig(config);
-  stdout.write(`Added root: ${root}\n`);
-  return EXIT_OK;
+  if (positionals[2] === "add") {
+    if (!config.roots.includes(root)) config.roots.push(root);
+    await saveConfig(config);
+    stdout.write(`Added root: ${root}\n`);
+    return EXIT_OK;
+  }
+  if (positionals[2] === "remove") {
+    const rootsBefore = config.roots.length;
+    const worktreeRootsBefore = config.policy.worktreeRoots.length;
+    config.roots = config.roots.filter((existing) => !samePath(existing, root));
+    config.policy.worktreeRoots = config.policy.worktreeRoots.filter((existing) => !samePath(existing, root));
+    if (config.roots.length === rootsBefore && config.policy.worktreeRoots.length === worktreeRootsBefore) {
+      stdout.write(`${root} was not a registered root.\n`);
+      return EXIT_OK;
+    }
+    await saveConfig(config);
+    stdout.write(`Removed root: ${root}\n`);
+    return EXIT_OK;
+  }
+  throw new UsageError(usageMessage);
 }
 
-async function runAuto(positionals: string[], options: Options): Promise<number> {
+export async function runAuto(positionals: string[], options: Options): Promise<number> {
   const action = positionals[1];
   if (action === "--once") return await runClean(options, true);
   if (action === "install") {
+    // Check support and install before ever touching config: on a platform
+    // where installScheduler throws (anything but win32 today), a failed
+    // `auto install` must not leave a config file behind as a side effect.
+    await installScheduler(process.execPath, path.resolve(process.argv[1]), options.interval || "weekly");
     const config = await loadConfig();
     await saveConfig(config, process.env);
-    await installScheduler(process.execPath, path.resolve(process.argv[1]), options.interval || "weekly");
     stdout.write(`Installed ${options.interval || "weekly"} automatic cleanup.\n`);
     return EXIT_OK;
   }

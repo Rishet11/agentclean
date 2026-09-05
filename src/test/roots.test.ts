@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { discoverRoots } from "../core/roots.js";
+import { canRegisterRoot, discoverRoots } from "../core/roots.js";
 
 test("discovers existing common dev directories, dedupes nested git repos, drops nested paths, and never throws on an unreadable directory", async () => {
   const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "agentclean-roots-")));
@@ -44,4 +44,41 @@ test("never throws and returns an empty list when home does not exist", async ()
   const missingHome = path.join(os.tmpdir(), "agentclean-roots-missing-", String(Date.now()));
   const roots = await discoverRoots({ home: missingHome, cwd: missingHome, env: {} });
   assert.deepEqual(roots, []);
+});
+
+// canRegisterRoot is pure and synchronous (no filesystem access), so every
+// dangerous shape it must refuse -- and the legitimate shape it must allow --
+// is testable directly against plain strings, no fixtures required. `home`
+// has three segments below the filesystem root so an ancestor one level up
+// ("/Users/alice") is distinguishable from both the root itself and a
+// top-level OS directory.
+const home = path.join(path.sep, "Users", "alice", "work");
+
+const dangerousCases: Array<{ name: string; candidate: string; existingRoots?: string[] }> = [
+  { name: "$HOME itself", candidate: home },
+  { name: "the filesystem root", candidate: path.sep },
+  { name: "a system directory unrelated to home (shallow, not on home's path at all)", candidate: path.join(path.sep, "etc") },
+  { name: "an ancestor of home one level up (not itself shallow enough to be caught by the system-directory check alone)", candidate: path.join(path.sep, "Users", "alice") },
+  { name: "an ancestor of home that is also a top-level OS directory", candidate: path.join(path.sep, "Users") },
+  {
+    name: "a path that would swallow an already-approved, unrelated root",
+    candidate: path.join(home, "Desktop"),
+    existingRoots: [path.join(home, "Desktop", "unrelated-project")],
+  },
+];
+
+for (const { name, candidate, existingRoots } of dangerousCases) {
+  test(`canRegisterRoot refuses: ${name}`, () => {
+    assert.equal(canRegisterRoot(candidate, home, existingRoots ?? []), false);
+  });
+}
+
+test("canRegisterRoot allows a directory git evidence actually justifies, alongside unrelated existing roots", () => {
+  const derivedPool = path.join(home, ".ao", "data", "worktrees");
+  assert.equal(canRegisterRoot(derivedPool, home, [path.join(home, "dev")]), true);
+});
+
+test("canRegisterRoot allows re-registering a path that exactly matches an existing root (no false positive on the swallow check)", () => {
+  const existing = path.join(home, "dev");
+  assert.equal(canRegisterRoot(existing, home, [existing]), true);
 });

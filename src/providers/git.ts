@@ -6,6 +6,7 @@ import { measureTree } from "../core/filesystem.js";
 import { hashValue } from "../core/plan.js";
 import { normalizeVersion } from "./command.js";
 import { isWithin, isWithinAny, safeRealPath, samePath } from "../core/paths.js";
+import { canRegisterRoot, dropNested } from "../core/roots.js";
 
 interface WorktreeRecord { path: string; branch?: string; locked: boolean; prunable: boolean; }
 
@@ -202,6 +203,85 @@ export class GitWorktreeProvider implements StorageProvider {
     if (typeof repo !== "string" || typeof target !== "string") return { ok: false, bytes: 0, reason: "invalid worktree metadata" };
     const result = await runCommand(["git", "worktree", "remove", target], repo, 120_000);
     return result.code === 0 ? { ok: true, bytes: candidate.bytes } : { ok: false, bytes: 0, reason: result.stderr.trim() || `git exited ${result.code}` };
+  }
+}
+
+export interface DerivedWorktreePoolRoot {
+  /** Directory to register as an approved root. */
+  root: string;
+  /** How many of this pool's currently-unregistered worktrees sit under it. */
+  worktreeCount: number;
+}
+
+/** Deepest directory every path in `paths` shares. Undefined only for an empty input. */
+function longestCommonDirectory(paths: string[]): string | undefined {
+  if (paths.length === 0) return undefined;
+  let common = path.resolve(paths[0]).split(path.sep);
+  for (const entry of paths.slice(1)) {
+    const segments = path.resolve(entry).split(path.sep);
+    let index = 0;
+    const max = Math.min(common.length, segments.length);
+    while (index < max && common[index] === segments[index]) index += 1;
+    common = common.slice(0, index);
+  }
+  if (common.length === 0) return undefined;
+  const joined = common.join(path.sep);
+  return joined === "" ? path.sep : joined;
+}
+
+/**
+ * Finds directories that git's own worktree metadata proves hold spare
+ * copies (linked worktrees) outside every currently-approved root, so a
+ * caller can register them and stop refusing real, git-verified worktrees on
+ * `outside-allowed-root` alone. `~/.ao` (or any other specific path) never
+ * appears here -- every directory this returns is read out of `git worktree
+ * list --porcelain`, never assumed.
+ *
+ * Grouping is per repository, never across repositories: a shared parent
+ * between two unrelated projects' pools is not evidence of anything, so it
+ * is never inferred. Within one repository, this takes the deepest directory
+ * shared by the *parents* of that repository's own linked, non-main
+ * worktrees that are not already inside `context.roots`. A repository with
+ * exactly one such worktree yields that worktree's own parent directory --
+ * the pool directory a single instance still implies -- rather than the
+ * worktree's own path, which is why every parent (not every worktree path
+ * itself) feeds the common-directory computation. Several worktrees under
+ * the same pool converge on that shared pool directory directly, instead of
+ * each getting its own entry.
+ *
+ * Every candidate then passes `canRegisterRoot` before being offered -- this
+ * function proposes evidence, it never itself decides something is safe to
+ * register. Read-only and bounded like `discoverRoots`: a failure here must
+ * never fail the surrounding scan, only skip the convenience.
+ */
+export async function discoverWorktreePoolRoots(context: { roots: string[]; home: string }): Promise<DerivedWorktreePoolRoot[]> {
+  try {
+    const repositories = await findRepositories(context.roots);
+    const limit = createLimiter(12);
+    const listings = await Promise.all(repositories.map((repo) => limit(() => worktrees(repo).catch(() => undefined))));
+    const outsidePaths: string[] = [];
+    const candidateParents = new Set<string>();
+    for (const entries of listings) {
+      if (!entries || entries.length <= 1) continue;
+      const main = entries[0]?.path;
+      const outsideForRepo: string[] = [];
+      for (const entry of entries.slice(1)) {
+        const target = path.resolve(entry.path);
+        if (main && samePath(main, target)) continue;
+        if (isWithinAny(context.roots, target)) continue;
+        outsideForRepo.push(target);
+      }
+      if (outsideForRepo.length === 0) continue;
+      outsidePaths.push(...outsideForRepo);
+      const parent = longestCommonDirectory(outsideForRepo.map((item) => path.dirname(item)));
+      if (parent) candidateParents.add(parent);
+    }
+    const safe = dropNested([...candidateParents].filter((candidate) => canRegisterRoot(candidate, context.home, context.roots)));
+    return safe
+      .map((root) => ({ root, worktreeCount: outsidePaths.filter((item) => isWithin(root, item)).length }))
+      .filter((pool) => pool.worktreeCount > 0);
+  } catch {
+    return [];
   }
 }
 

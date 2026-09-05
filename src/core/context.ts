@@ -31,7 +31,14 @@ declare module "./types.js" {
 }
 
 export function makeContext(config: ConfigFile, roots: string[] = [], cwd = processCwd(), env = processEnv, allowProjectArtifacts = false): ExecuteContext {
-  const allRoots = [...new Set([cwd, ...config.roots, ...roots].map((root) => absolutePath(root, cwd)))];
+  // `config.policy.worktreeRoots` is where cli.ts persists a pool directory
+  // derived from git's own worktree metadata (see providers/git.ts's
+  // discoverWorktreePoolRoots and cli.ts's registerDiscoveredWorktreePools).
+  // It is folded in here, not kept as a separate concept a provider has to
+  // know about, so once registered it is simply an approved root like any
+  // other: every `isWithinAny(context.roots, ...)` check downstream (the
+  // git provider's outside-allowed-root blocker included) sees it for free.
+  const allRoots = [...new Set([cwd, ...config.roots, ...config.policy.worktreeRoots, ...roots].map((root) => absolutePath(root, cwd)))];
   return { now: Date.now(), roots: allRoots, configRoots: config.roots, cwd, home: homedir(), env, policy: config.policy, allowProjectArtifacts: allowProjectArtifacts || config.allowProjectArtifacts === true, reportProjectArtifacts: true, dryRun: false, runDir: stateDir(env) };
 }
 
