@@ -42,4 +42,6 @@ jobs:
           echo "tag=$tag package.json=$pkg"
           test "$tag" = "$pkg"
 
-      - run: npm publish --access public --provenance
+      # Provenance is generated automatically when publishing from GitHub
+      # Actions with trusted publishing, so no flag is needed here.
+      - run: npm publish --access public
