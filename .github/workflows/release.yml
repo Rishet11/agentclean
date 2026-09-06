@@ -1,0 +1,45 @@
+name: Release
+
+# Publishing is driven by a tag, so a release is "push v0.1.1" and nothing else.
+# No NPM_TOKEN and no one-time password: npm trusts this workflow directly via
+# GitHub's OIDC identity, which is why id-token: write below is required.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs a newer npm than the one bundled with Node 22.
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@latest
+
+      - run: npm ci
+
+      # Never publish something that does not build or pass its own tests.
+      - run: npm run typecheck
+      - run: npm test
+
+      # Refuse to publish a tag that disagrees with package.json, which is the
+      # easiest release mistake to make and the most confusing to debug later.
+      - name: Tag must match package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          echo "tag=$tag package.json=$pkg"
+          test "$tag" = "$pkg"
+
+      - run: npm publish --access public --provenance
